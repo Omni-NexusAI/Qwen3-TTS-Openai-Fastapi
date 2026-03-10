@@ -200,6 +200,11 @@ def data_uri_from_file(file_path: Path) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def base64_from_file(file_path: Path) -> str:
+    """Encode a file's contents as base64 string (no data URI prefix)."""
+    return base64.b64encode(file_path.read_bytes()).decode("utf-8")
+
+
 def write_bytes_to_temp_audio(content: bytes, ext: str) -> str:
     """Write raw audio bytes to a temporary file and return its path."""
     ext = ext.lstrip(".")
@@ -207,6 +212,41 @@ def write_bytes_to_temp_audio(content: bytes, ext: str) -> str:
     os.close(fd)
     Path(path).write_bytes(content)
     return path
+
+
+def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """Convert raw PCM bytes to WAV format with proper header."""
+    import struct
+    import io
+    
+    bytes_per_sample = bits_per_sample // 8
+    byte_rate = sample_rate * num_channels * bytes_per_sample
+    block_align = num_channels * bytes_per_sample
+    data_size = len(pcm_bytes)
+    
+    buffer = io.BytesIO()
+    
+    # RIFF header
+    buffer.write(b'RIFF')
+    buffer.write(struct.pack('<I', 36 + data_size))  # File size - 8
+    buffer.write(b'WAVE')
+    
+    # Format chunk
+    buffer.write(b'fmt ')
+    buffer.write(struct.pack('<I', 16))  # Chunk size
+    buffer.write(struct.pack('<H', 1))  # Audio format (PCM)
+    buffer.write(struct.pack('<H', num_channels))
+    buffer.write(struct.pack('<I', sample_rate))
+    buffer.write(struct.pack('<I', byte_rate))
+    buffer.write(struct.pack('<H', block_align))
+    buffer.write(struct.pack('<H', bits_per_sample))
+    
+    # Data chunk
+    buffer.write(b'data')
+    buffer.write(struct.pack('<I', data_size))
+    buffer.write(pcm_bytes)
+    
+    return buffer.getvalue()
 
 
 def request_tts(base_url: str, payload: Dict[str, Any], timeout_s: float) -> Tuple[bytes, str]:
@@ -221,6 +261,89 @@ def request_tts(base_url: str, payload: Dict[str, Any], timeout_s: float) -> Tup
     if ext == "pcm":
         ext = "raw"
     return r.content, ext
+
+
+def request_tts_voice_clone(base_url: str, payload: Dict[str, Any], timeout_s: float) -> Tuple[bytes, str]:
+    """Call the /v1/audio/voice-clone endpoint (non-streaming) and return audio bytes and extension."""
+    url = normalize_base_url(base_url) + "/v1/audio/voice-clone"
+    response_format = payload.get("response_format") or "wav"
+    payload["response_format"] = response_format
+    with httpx.Client(timeout=timeout_s) as client:
+        r = client.post(url, json=payload)
+        r.raise_for_status()
+    ext = response_format.lower()
+    if ext == "pcm":
+        ext = "raw"
+    return r.content, ext
+
+
+def request_tts_streaming(
+    base_url: str, 
+    payload: Dict[str, Any], 
+    timeout_s: float
+) -> Tuple[bytes, str, Dict[str, Any]]:
+    """
+    Call the /v1/audio/voice-clone/stream endpoint and return audio bytes, extension, and timing info.
+    
+    Returns:
+        Tuple of (audio_bytes, extension, timing_info)
+    """
+    import struct
+    import json as json_module
+    
+    url = normalize_base_url(base_url) + "/v1/audio/voice-clone/stream"
+    
+    with httpx.Client(timeout=timeout_s) as client:
+        with client.stream("POST", url, json=payload) as response:
+            response.raise_for_status()
+            
+            chunks = []
+            timing_info = {}
+            buffer = b""
+            
+            for chunk in response.iter_bytes():
+                buffer += chunk
+                
+                # Process complete chunks
+                # Format: [4 bytes JSON length][JSON metadata][4 bytes audio length][audio bytes]
+                while len(buffer) >= 4:
+                    json_len = struct.unpack('<I', buffer[:4])[0]
+                    if len(buffer) < 4 + json_len + 4:
+                        break  # Need more data for JSON + audio length
+                    
+                    json_bytes = buffer[4:4 + json_len]
+                    metadata = json_module.loads(json_bytes.decode('utf-8'))
+                    audio_len = struct.unpack('<I', buffer[4 + json_len:4 + json_len + 4])[0]
+                    
+                    if len(buffer) < 4 + json_len + 4 + audio_len:
+                        break  # Need more data for audio bytes
+                    
+                    audio_bytes = buffer[4 + json_len + 4:4 + json_len + 4 + audio_len]
+                    buffer = buffer[4 + json_len + 4 + audio_len:]  # Keep remaining data
+                    
+                    if metadata.get("error"):
+                        raise RuntimeError(metadata["error"])
+                    
+                    if metadata.get("done"):
+                        timing_info = {
+                            "first_chunk_time": metadata.get("first_chunk_time"),
+                            "total_time": metadata.get("total_time"),
+                            "audio_duration": metadata.get("audio_duration"),
+                            "rtf": metadata.get("rtf"),
+                            "chunk_count": metadata.get("chunk_count"),
+                        }
+                    elif len(audio_bytes) > 0:
+                        chunks.append(audio_bytes)
+            
+            # Combine all audio chunks (raw PCM data)
+            total_length = sum(len(c) for c in chunks)
+            combined_pcm = b"".join(chunks)
+            
+            # Convert raw PCM to WAV format with proper header
+            # PCM is 16-bit signed integers at 24000 Hz
+            wav_bytes = pcm_to_wav(combined_pcm, sample_rate=24000)
+            
+            return wav_bytes, "wav", timing_info
 
 
 def try_fetch_voices(base_url: str, timeout_s: float) -> List[str]:
@@ -333,7 +456,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
         # Header section
         gr.HTML(
             """
-            <div id="header">
+            <div id=","header">
               <div style="font-size: 1.35rem; font-weight: 700;">Qwen3 Voice Studio</div>
               <div class="small">
                 Create & save reusable voice profiles (preset, designed, or cloned) and export them for inference.
@@ -409,7 +532,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                                 preset_generate_btn = gr.Button("Generate", variant="primary")
                                 preset_save_btn = gr.Button("Save profile", variant="secondary")
                             with gr.Column(scale=1, min_width=320):
-                                preset_audio = gr.Audio(label="Output audio", type="filepath")
+                                preset_audio = gr.Audio(label="Output audio (trimmable)", type="filepath", editable=True)
                                 preset_download = gr.File(label="Download audio")
 
                     # Voice design (VoiceDesign)
@@ -447,7 +570,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                                 design_generate_btn = gr.Button("Generate reference clip", variant="primary")
                                 design_save_as_clone_btn = gr.Button("Save as reusable clone profile", variant="secondary")
                             with gr.Column(scale=1, min_width=320):
-                                design_audio = gr.Audio(label="Reference audio (output)", type="filepath")
+                                design_audio = gr.Audio(label="Reference audio (output, trimmable)", type="filepath", editable=True)
                                 design_download = gr.File(label="Download reference audio")
 
                     # Voice clone (Base)
@@ -494,7 +617,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                                 clone_generate_btn = gr.Button("Generate", variant="primary")
                                 clone_save_btn = gr.Button("Save clone profile", variant="secondary")
                             with gr.Column(scale=1, min_width=320):
-                                clone_audio = gr.Audio(label="Output audio", type="filepath")
+                                clone_audio = gr.Audio(label="Output audio (trimmable)", type="filepath", editable=True)
                                 clone_download = gr.File(label="Download audio")
 
             # Library tab
@@ -532,10 +655,14 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                             value="wav",
                         )
                         play_speed = gr.Slider(label="Speed", minimum=0.25, maximum=4.0, value=1.0, step=0.05)
-                        play_generate_btn = gr.Button("Generate", variant="primary")
+                        play_generate_btn = gr.Button("🎙️ Generate (Streaming)", variant="primary")
                     with gr.Column(scale=1, min_width=360):
-                        play_audio = gr.Audio(label="Output audio", type="filepath")
+                        play_audio = gr.Audio(label="Output audio (trimmable)", type="filepath", editable=True)
                         play_download = gr.File(label="Download audio")
+                        # Timing display
+                        play_timing = gr.Markdown(
+                            value="",
+                        )
 
         # ------------------------------------------------------------------
         # Callback implementations
@@ -641,20 +768,44 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                 raise gr.Error("Reference audio is required.")
             if (not xvec_only) and (not ref_text.strip()):
                 raise gr.Error("Reference transcript is required unless x_vector_only_mode is enabled.")
-            ref_uri = data_uri_from_file(Path(ref_audio_path))
+            ref_b64 = base64_from_file(Path(ref_audio_path))
             payload = {
                 "input": text,
                 "voice": "Vivian",
                 "language": language,
                 "task_type": "Base",
-                "ref_audio": ref_uri,
+                "ref_audio": ref_b64,
                 "ref_text": ref_text.strip(),
                 "x_vector_only_mode": bool(xvec_only),
                 "response_format": "wav",
             }
-            audio_bytes, ext = request_tts(base_url, payload, float(timeout_s))
-            out_path = write_bytes_to_temp_audio(audio_bytes, ext)
-            return out_path, out_path, "✅ Generated audio."
+            # Use streaming endpoint for better timing info
+            try:
+                audio_bytes, ext, timing_info = request_tts_streaming(base_url, payload, float(timeout_s))
+                out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                
+                # Format timing info as readable markdown
+                first_chunk = timing_info.get('first_chunk_time')
+                total_time = timing_info.get('total_time')
+                audio_duration = timing_info.get('audio_duration')
+                rtf = timing_info.get('rtf')
+                chunk_count = timing_info.get('chunk_count', 0)
+                
+                timing_md = f"""### ⏱️ Generation Timing
+| Metric | Value |
+|--------|-------|
+| **First chunk** | {first_chunk:.2f}s |
+| **Total time** | {total_time:.2f}s |
+| **Audio duration** | {audio_duration:.2f}s |
+| **RTF** | {rtf:.2f}x |
+| **Chunks** | {chunk_count} |
+"""
+                return out_path, out_path, timing_md
+            except Exception as e:
+                # Fallback to non-streaming
+                audio_bytes, ext = request_tts_voice_clone(base_url, payload, float(timeout_s))
+                out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                return out_path, out_path, f"⚠️ Used non-streaming fallback: {e}"
 
         def on_save_clone_profile(
             library_dir_str: str,
@@ -749,6 +900,10 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                     "voice": vp.voice,
                     "instructions": vp.instructions or "",
                 })
+                # Use non-streaming for CustomVoice
+                audio_bytes, ext = request_tts(base_url, payload, float(timeout_s))
+                out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                return out_path, out_path, ""
             elif vp.task_type == "Base":
                 payload.update({
                     "task_type": "Base",
@@ -759,22 +914,50 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                     ref_file = profile_dir(Path(library_dir_str), vp.profile_id) / vp.ref_audio_filename
                     if not ref_file.exists():
                         raise gr.Error("This profile is missing its reference audio file.")
-                    payload["ref_audio"] = data_uri_from_file(ref_file)
+                    payload["ref_audio"] = base64_from_file(ref_file)
                 else:
                     raise gr.Error("This Base profile has no stored ref_audio.")
                 if not vp.x_vector_only_mode:
                     if not vp.ref_text.strip():
                         raise gr.Error("This profile needs ref_text unless x_vector_only_mode is enabled.")
                     payload["ref_text"] = vp.ref_text.strip()
+                
+                # Use streaming for Base model (voice cloning)
+                try:
+                    audio_bytes, ext, timing_info = request_tts_streaming(base_url, payload, float(timeout_s))
+                    out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                    
+                    # Format timing info as readable markdown
+                    first_chunk = timing_info.get('first_chunk_time')
+                    total_time = timing_info.get('total_time')
+                    audio_duration = timing_info.get('audio_duration')
+                    rtf = timing_info.get('rtf')
+                    chunk_count = timing_info.get('chunk_count', 0)
+                    
+                    timing_md = f"""### ⏱️ Generation Timing
+| Metric | Value |
+|--------|-------|
+| **First chunk** | {first_chunk:.2f}s |
+| **Total time** | {total_time:.2f}s |
+| **Audio duration** | {audio_duration:.2f}s |
+| **RTF** | {rtf:.2f}x |
+| **Chunks** | {chunk_count} |
+"""
+                    return out_path, out_path, timing_md
+                except Exception as e:
+                    # Fallback to non-streaming voice clone endpoint
+                    audio_bytes, ext = request_tts_voice_clone(base_url, payload, float(timeout_s))
+                    out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                    return out_path, out_path, f"⚠️ Used non-streaming fallback: {e}"
             else:
                 payload.update({
                     "task_type": "VoiceDesign",
                     "voice": vp.voice or "Vivian",
                     "instructions": vp.instructions or "",
                 })
-            audio_bytes, ext = request_tts(base_url, payload, float(timeout_s))
-            out_path = write_bytes_to_temp_audio(audio_bytes, ext)
-            return out_path, out_path
+                audio_bytes, ext = request_tts(base_url, payload, float(timeout_s))
+                out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                return out_path, out_path, ""
 
         # ------------------------------------------------------------------
         # Wire up UI interactions to callbacks
@@ -853,7 +1036,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
         play_generate_btn.click(
             fn=on_play_generate,
             inputs=[base_url_in, timeout_in, library_dir_in, play_profile_id, play_text, play_response_format, play_speed],
-            outputs=[play_audio, play_download],
+            outputs=[play_audio, play_download, play_timing],
         )
 
         demo.load(fn=on_library_refresh, inputs=[library_dir_in], outputs=[library_table, play_profile_id])
