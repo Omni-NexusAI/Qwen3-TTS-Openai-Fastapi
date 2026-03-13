@@ -27,6 +27,8 @@ from ..structures.schemas import (
     VoiceInfo,
     VoiceCloneRequest,
     VoiceCloneCapabilities,
+    StreamingVoiceCloneRequest,
+    TimingInfo,
 )
 from ..services.text_processing import normalize_text
 from ..services.audio_encoding import encode_audio, get_content_type, DEFAULT_SAMPLE_RATE
@@ -967,6 +969,196 @@ async def create_voice_clone(
         raise
     except Exception as e:
         logger.error(f"Voice cloning failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "processing_error",
+                "message": str(e),
+                "type": "server_error",
+            },
+        )
+
+
+@router.post("/audio/voice-clone/stream")
+async def create_voice_clone_stream(
+    request: StreamingVoiceCloneRequest,
+    client_request: Request,
+):
+    """
+    Stream voice-cloned speech generation with real-time timing metrics.
+
+    This endpoint streams audio chunks as they are generated, providing
+    significantly lower latency for the first audio output.
+
+    Returns WAV audio chunks with timing information in response headers.
+
+    **Timing Headers:**
+    - X-First-Chunk-Time: Time in seconds until first audio chunk
+    - X-Total-Time: Total generation time in seconds
+    - X-Audio-Duration: Duration of generated audio in seconds
+    - X-RTF: Real-Time Factor (generation time / audio duration)
+    - X-Chunk-Count: Number of audio chunks generated
+    """
+    try:
+        backend = await get_tts_backend()
+
+        # Check if voice cloning is supported
+        if not backend.supports_voice_cloning():
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "voice_cloning_not_supported",
+                    "message": "Voice cloning requires the Base model (Qwen3-TTS-12Hz-1.7B-Base). "
+                               "Set TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-Base environment variable and restart the server.",
+                    "type": "invalid_request_error",
+                },
+            )
+
+        # Validate ICL mode requires ref_text
+        if not request.x_vector_only_mode and not request.ref_text:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "missing_ref_text",
+                    "message": "ICL mode requires ref_text (transcript of reference audio). "
+                               "Either provide ref_text or set x_vector_only_mode=True.",
+                    "type": "invalid_request_error",
+                },
+            )
+
+        # Decode base64 audio
+        try:
+            audio_bytes = base64.b64decode(request.ref_audio)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_audio",
+                    "message": f"Failed to decode base64 audio: {e}",
+                    "type": "invalid_request_error",
+                },
+            )
+
+        # Load audio using soundfile
+        try:
+            audio_buffer = io.BytesIO(audio_bytes)
+            ref_audio, ref_sr = sf.read(audio_buffer)
+
+            # Convert to mono if stereo
+            if len(ref_audio.shape) > 1:
+                ref_audio = ref_audio.mean(axis=1)
+
+            ref_audio = ref_audio.astype(np.float32)
+
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "audio_processing_error",
+                    "message": f"Failed to process reference audio: {e}. "
+                               "Ensure the audio is a valid WAV, MP3, or other supported format.",
+                    "type": "invalid_request_error",
+                },
+            )
+
+        # Normalize input text
+        normalized_text = normalize_text(request.input, request.normalization_options)
+
+        if not normalized_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_input",
+                    "message": "Input text is empty after normalization",
+                    "type": "invalid_request_error",
+                },
+            )
+
+        # Create async generator for streaming
+        async def audio_stream_generator():
+            start_time = time.time()
+            first_chunk_time = None
+            chunk_count = 0
+            total_samples = 0
+            sample_rate = 24000  # Default, will be updated from chunks
+
+            try:
+                # Stream audio chunks from backend
+                async for chunk, sr in backend.stream_generate_voice_clone(
+                    text=normalized_text,
+                    ref_audio=ref_audio,
+                    ref_audio_sr=ref_sr,
+                    ref_text=request.ref_text,
+                    language=request.language or "Auto",
+                    x_vector_only_mode=request.x_vector_only_mode,
+                    speed=request.speed,
+                    emit_every_frames=request.emit_every_frames,
+                    decode_window_frames=request.decode_window_frames,
+                ):
+                    chunk_count += 1
+                    sample_rate = sr
+                    total_samples += len(chunk)
+
+                    if first_chunk_time is None:
+                        first_chunk_time = time.time()
+
+                    # Encode chunk to raw PCM format (not WAV) to avoid header issues when concatenating
+                    # The client will combine all PCM chunks and create a single WAV file
+                    chunk_bytes = encode_audio(chunk, "pcm", sr)
+
+                    # Yield chunk with timing metadata as JSON header
+                    import json
+                    timing = {
+                        "chunk": chunk_count,
+                        "first_chunk_time": first_chunk_time - start_time if first_chunk_time else None,
+                    }
+                    # Format: [4 bytes JSON length][JSON metadata][4 bytes audio length][audio bytes]
+                    timing_json = json.dumps(timing).encode('utf-8')
+                    import struct
+                    yield struct.pack('<I', len(timing_json)) + timing_json + struct.pack('<I', len(chunk_bytes)) + chunk_bytes
+
+                # Calculate final timing
+                total_time = time.time() - start_time
+                audio_duration = total_samples / sample_rate if sample_rate > 0 else 0
+                rtf = total_time / audio_duration if audio_duration > 0 else 0
+
+                # Send final timing info as last chunk
+                final_timing = {
+                    "done": True,
+                    "first_chunk_time": first_chunk_time - start_time if first_chunk_time else None,
+                    "total_time": total_time,
+                    "audio_duration": audio_duration,
+                    "rtf": rtf,
+                    "chunk_count": chunk_count,
+                }
+                timing_json = json.dumps(final_timing).encode('utf-8')
+                import struct
+                # Format: [4 bytes JSON length][JSON metadata][4 bytes audio length (0)][no audio]
+                yield struct.pack('<I', len(timing_json)) + timing_json + struct.pack('<I', 0)
+
+            except Exception as e:
+                logger.error(f"Streaming generation error: {e}")
+                import json
+                import struct as struct_module
+                error_data = {"error": str(e)}
+                error_json = json.dumps(error_data).encode()
+                # Format: [4 bytes JSON length][JSON metadata][4 bytes audio length (0)]
+                yield struct_module.pack('<I', len(error_json)) + error_json + struct_module.pack('<I', 0)
+
+        return StreamingResponse(
+            audio_stream_generator(),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": "attachment; filename=streaming_voice_clone.wav",
+                "Cache-Control": "no-cache",
+                "X-Streaming": "true",
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Streaming voice cloning failed: {e}")
         raise HTTPException(
             status_code=500,
             detail={

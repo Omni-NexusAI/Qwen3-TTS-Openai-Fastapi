@@ -117,18 +117,17 @@ class OfficialQwen3TTSBackend(TTSBackend):
                     raise RuntimeError(f"Failed to load model with any attention implementation. Last error: {last_error}")
 
             # Apply torch.compile() optimization for faster inference
-            if torch.cuda.is_available() and hasattr(torch, 'compile'):
-                logger.info("Applying torch.compile() optimization...")
-                try:
-                    # Compile the model with reduce-overhead mode for faster inference
-                    self.model.model = torch.compile(
-                        self.model.model,
-                        mode="reduce-overhead",  # Optimize for inference speed
-                        fullgraph=False,  # Allow graph breaks for compatibility
-                    )
-                    logger.info("torch.compile() optimization applied successfully")
-                except Exception as e:
-                    logger.warning(f"Could not apply torch.compile(): {e}")
+            # Note: torch.compile() causes persistent crashes on this system, even with:
+            # - TORCHINDUCTOR_COMPILE_THREADS=1 (compile in main process)
+            # - mode="default" (less aggressive than reduce-overhead)
+            # - suppress_errors=True
+            # The CodePredictor compilation specifically causes subprocess crashes.
+            # Disabling for stability - other optimizations still provide speedup:
+            # - Flash Attention 2: ~2x faster attention
+            # - TF32: faster matmul on Ampere+ GPUs
+            # - cuDNN benchmark: optimal convolution algorithms
+            compile_enabled = False
+            logger.info("Skipping torch.compile() for stability - using Flash Attention 2, TF32, and cuDNN optimizations")
             
             # Enable cuDNN benchmarking for optimal convolution algorithms
             if torch.cuda.is_available():
@@ -140,6 +139,19 @@ class OfficialQwen3TTSBackend(TTSBackend):
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
                 logger.info("Enabled TF32 precision for faster matmul")
+            
+            # Enable streaming optimizations for low-latency generation
+            if self.supports_voice_cloning():
+                try:
+                    logger.info("Enabling streaming optimizations for low-latency generation...")
+                    self.model.enable_streaming_optimizations(
+                        decode_window_frames=80,
+                        use_compile=compile_enabled,  # Use compile if it was enabled successfully
+                        compile_mode="reduce-overhead",
+                    )
+                    logger.info("Streaming optimizations enabled successfully")
+                except Exception as e:
+                    logger.warning(f"Could not enable streaming optimizations: {e}")
             
             self._ready = True
             logger.info(f"Official Qwen3-TTS backend loaded successfully on {self.device}")
@@ -509,3 +521,72 @@ class OfficialQwen3TTSBackend(TTSBackend):
         except Exception as e:
             logger.error(f"Custom voice generation failed: {e}")
             raise RuntimeError(f"Custom voice generation failed: {e}")
+
+    async def stream_generate_voice_clone(
+        self,
+        text: str,
+        ref_audio: np.ndarray,
+        ref_audio_sr: int,
+        ref_text: Optional[str] = None,
+        language: str = "Auto",
+        x_vector_only_mode: bool = False,
+        speed: float = 1.0,
+        emit_every_frames: int = 4,
+        decode_window_frames: int = 80,
+    ):
+        """
+        Stream voice-cloned speech generation, yielding audio chunks as generated.
+
+        This method provides significantly lower latency by yielding audio chunks
+        as they are generated, rather than waiting for complete generation.
+
+        Args:
+            text: The text to synthesize
+            ref_audio: Reference audio as numpy array
+            ref_audio_sr: Sample rate of reference audio
+            ref_text: Transcript of reference audio (required for ICL mode)
+            language: Language code (e.g., "English", "Chinese", "Auto")
+            x_vector_only_mode: If True, use x-vector only (no ref_text needed)
+            speed: Speech speed multiplier (0.25 to 4.0)
+            emit_every_frames: Emit audio chunk every N codec frames (lower = lower latency)
+            decode_window_frames: Decode window size in frames (larger = better quality)
+
+        Yields:
+            Tuple of (audio_chunk, sample_rate) as audio is generated
+        """
+        if not self._ready:
+            await self.initialize()
+
+        if not self.supports_voice_cloning():
+            raise RuntimeError(
+                "Voice cloning requires the Base model (Qwen3-TTS-12Hz-1.7B-Base). "
+                "The current model does not support voice cloning."
+            )
+
+        try:
+            # Create voice clone prompt first
+            voice_clone_prompt = self.model.create_voice_clone_prompt(
+                ref_audio=(ref_audio, ref_audio_sr),
+                ref_text=ref_text,
+                x_vector_only_mode=x_vector_only_mode,
+            )
+
+            # Stream audio chunks from the model
+            for chunk, sr in self.model.stream_generate_voice_clone(
+                text=text,
+                language=language,
+                voice_clone_prompt=voice_clone_prompt,
+                emit_every_frames=emit_every_frames,
+                decode_window_frames=decode_window_frames,
+            ):
+                # Apply speed adjustment if needed
+                if speed != 1.0 and LIBROSA_AVAILABLE:
+                    chunk = librosa.effects.time_stretch(chunk.astype(np.float32), rate=speed)
+                elif speed != 1.0:
+                    logger.warning("Speed adjustment requested but librosa not available")
+
+                yield chunk, sr
+
+        except Exception as e:
+            logger.error(f"Streaming voice cloning failed: {e}")
+            raise RuntimeError(f"Streaming voice cloning failed: {e}")
