@@ -138,6 +138,15 @@ class VoiceCloneRequest(BaseModel):
         le=4.0,
         description="The speed of the generated audio. Select a value from 0.25 to 4.0.",
     )
+    seed: Optional[int] = Field(
+        default=-1,
+        description="Random seed for reproducibility; -1 for random.",
+    )
+    cache_key: Optional[str] = Field(
+        default=None,
+        description="Optional server-side prompt cache key for reusable voice profiles.",
+        max_length=256,
+    )
     normalization_options: Optional[NormalizationOptions] = Field(
         default_factory=NormalizationOptions,
         description="Options for the text normalization system",
@@ -162,4 +171,96 @@ class VoiceCloneCapabilities(BaseModel):
     x_vector_mode_available: bool = Field(
         ...,
         description="Whether x-vector only mode is available.",
+    )
+
+
+class StreamingVoiceCloneRequest(BaseModel):
+    """Request schema for streaming voice cloning endpoint."""
+
+    input: str = Field(
+        ...,
+        description="The text to generate audio for using the cloned voice.",
+        max_length=4096,
+    )
+    ref_audio: str = Field(
+        ...,
+        description="Base64-encoded reference audio file (WAV, MP3, etc.).",
+    )
+    ref_text: Optional[str] = Field(
+        default=None,
+        description="Transcript of the reference audio. Required for ICL mode, optional for x-vector mode.",
+        max_length=4096,
+    )
+    x_vector_only_mode: bool = Field(
+        default=False,
+        description="If True, use x-vector only mode (no ref_text needed). If False, use ICL mode (ref_text required).",
+    )
+    language: Optional[str] = Field(
+        default="Auto",
+        description="Language code for TTS. If not provided, will auto-detect.",
+    )
+    speed: float = Field(
+        default=1.0,
+        ge=0.25,
+        le=4.0,
+        description="The speed of the generated audio. Select a value from 0.25 to 4.0.",
+    )
+    seed: Optional[int] = Field(
+        default=-1,
+        description="Random seed for reproducibility; -1 for random.",
+    )
+    emit_every_frames: int = Field(
+        default=4,
+        ge=1,
+        le=32,
+        description="Emit audio chunk every N codec frames. Lower = lower latency, more chunks.",
+    )
+    decode_window_frames: int = Field(
+        default=80,
+        ge=16,
+        le=200,
+        description="Decode window size in frames. Larger = better quality, slightly higher latency.",
+    )
+    cache_key: Optional[str] = Field(
+        default=None,
+        description="Optional server-side prompt cache key for reusable voice profiles.",
+        max_length=256,
+    )
+    normalization_options: Optional[NormalizationOptions] = Field(
+        default_factory=NormalizationOptions,
+        description="Options for the text normalization system",
+    )
+
+
+class TimingInfo(BaseModel):
+    """Timing information for streaming generation."""
+
+    first_chunk_time: Optional[float] = Field(
+        None,
+        description="Time in seconds until the first audio chunk was generated.",
+    )
+    total_time: float = Field(
+        ...,
+        description="Total generation time in seconds.",
+    )
+    audio_duration: float = Field(
+        ...,
+        description="Duration of the generated audio in seconds.",
+    )
+    rtf: float = Field(
+        ...,
+        description="Real-Time Factor (generation time / audio duration). Lower is better.",
+    )
+    chunk_count: int = Field(
+        ...,
+        description="Number of audio chunks generated.",
+    )
+
+
+class BackendModelSwitchRequest(BaseModel):
+    """Request body for switching the backend model (optimized backend only)."""
+
+    model_key: str = Field(
+        ...,
+        description="Model key to switch to (e.g. 0.6B-Base, 1.7B-Base). Must be in available list.",
     )

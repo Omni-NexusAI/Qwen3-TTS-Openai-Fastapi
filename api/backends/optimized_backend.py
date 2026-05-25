@@ -173,7 +173,7 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         try:
             self.model.enable_streaming_optimizations(
                 decode_window_frames=decode_window,
-                use_compile=True,
+                use_compile=opt.get("use_compile", False),
                 use_cuda_graphs=opt.get("use_cuda_graphs", False),
                 compile_mode=opt.get("compile_mode", "max-autotune"),
                 use_fast_codebook=opt.get("use_fast_codebook", True),
@@ -308,6 +308,25 @@ class OptimizedQwen3TTSBackend(TTSBackend):
     async def switch_model(self, model_key: str) -> None:
         """Hot-swap to a different model."""
         await self._ensure_model_loaded(model_key)
+
+    async def unload_model(self) -> None:
+        """Unload the active model and clear per-model voice prompt cache."""
+        import torch
+
+        if self._voice_prompt_cache:
+            logger.info(
+                f"Clearing voice prompt cache ({len(self._voice_prompt_cache)} entries)"
+            )
+            self._voice_prompt_cache.clear()
+
+        if self.model is not None:
+            logger.info(f"Unloading {self.current_model_key!r} on request...")
+            del self.model
+            self.model = None
+
+        self._ready = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # TTSBackend interface — generation
@@ -496,7 +515,7 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         return "optimized"
 
     def get_model_id(self) -> str:
-        if self.current_model_key:
+        if self.model is not None and self.current_model_key:
             info = self._model_info(self.current_model_key)
             return info.get("hf_id", "unknown")
         return "not-loaded"
@@ -544,6 +563,17 @@ class OptimizedQwen3TTSBackend(TTSBackend):
 
     def get_current_model_key(self) -> Optional[str]:
         return self.current_model_key
+
+    def get_loaded_models(self) -> List[str]:
+        if self.model is not None and self.current_model_key:
+            return [self.current_model_key]
+        return []
+
+    def get_runtime_state(self) -> Dict[str, Any]:
+        return {
+            "state": "loaded" if self.model is not None and self._ready else "unloaded",
+            "last_error": None,
+        }
 
     def get_config(self) -> dict:
         return self.config
