@@ -96,6 +96,21 @@ class OptimizedQwen3TTSBackend(TTSBackend):
     def _model_info(self, model_key: str) -> dict:
         return self.config.get("models", {}).get(model_key, {})
 
+    def _require_loaded_base_model(self) -> str:
+        """Return the active Base model key, or fail without loading anything."""
+        if self.model is None or not self._ready or not self.current_model_key:
+            raise RuntimeError(
+                "No Base model is loaded. Select a Base model and click "
+                "Load selected model before generating."
+            )
+        model_type = self._model_info(self.current_model_key).get("type")
+        if model_type != "base":
+            raise RuntimeError(
+                f"Loaded model '{self.current_model_key}' is not a Base model. "
+                "Load a Base model before voice cloning."
+            )
+        return self.current_model_key
+
     async def _ensure_model_loaded(self, model_key: str) -> None:
         """Load *model_key* if it is not the currently active model."""
         import torch
@@ -173,7 +188,7 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         try:
             self.model.enable_streaming_optimizations(
                 decode_window_frames=decode_window,
-                use_compile=True,
+                use_compile=opt.get("use_compile", False),
                 use_cuda_graphs=opt.get("use_cuda_graphs", False),
                 compile_mode=opt.get("compile_mode", "max-autotune"),
                 use_fast_codebook=opt.get("use_fast_codebook", True),
@@ -309,6 +324,25 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         """Hot-swap to a different model."""
         await self._ensure_model_loaded(model_key)
 
+    async def unload_model(self) -> None:
+        """Unload the active model and clear per-model voice prompt cache."""
+        import torch
+
+        if self._voice_prompt_cache:
+            logger.info(
+                f"Clearing voice prompt cache ({len(self._voice_prompt_cache)} entries)"
+            )
+            self._voice_prompt_cache.clear()
+
+        if self.model is not None:
+            logger.info(f"Unloading {self.current_model_key!r} on request...")
+            del self.model
+            self.model = None
+
+        self._ready = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # ------------------------------------------------------------------
     # TTSBackend interface — generation
     # ------------------------------------------------------------------
@@ -386,8 +420,8 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         speed: float = 1.0,
         cache_key: Optional[str] = None,
     ) -> Tuple[np.ndarray, int]:
-        """Non-streaming voice cloning (uses Base model)."""
-        await self._ensure_model_loaded(self._base_model_key())
+        """Non-streaming voice cloning using the already-loaded Base model."""
+        self._require_loaded_base_model()
 
         t0 = time.time()
 
@@ -449,11 +483,11 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         cache_key: Optional[str] = None,
     ) -> AsyncGenerator[Tuple[np.ndarray, int], None]:
         """
-        Real token-by-token streaming voice cloning (uses Base model).
+        Real token-by-token streaming voice cloning using the loaded Base model.
 
         Yields (pcm_chunk, sample_rate) tuples as the model generates audio.
         """
-        await self._ensure_model_loaded(self._base_model_key())
+        self._require_loaded_base_model()
 
         streaming_opts = self.config.get("optimization", {}).get("streaming", {})
         decode_window_frames = streaming_opts.get("decode_window_frames", 80)
@@ -496,7 +530,7 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         return "optimized"
 
     def get_model_id(self) -> str:
-        if self.current_model_key:
+        if self.model is not None and self.current_model_key:
             info = self._model_info(self.current_model_key)
             return info.get("hf_id", "unknown")
         return "not-loaded"
@@ -518,7 +552,7 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         return True
 
     def get_model_type(self) -> str:
-        if not self.current_model_key:
+        if self.model is None or not self.current_model_key:
             return "unknown"
         return self._model_info(self.current_model_key).get("type", "unknown")
 
@@ -544,6 +578,17 @@ class OptimizedQwen3TTSBackend(TTSBackend):
 
     def get_current_model_key(self) -> Optional[str]:
         return self.current_model_key
+
+    def get_loaded_models(self) -> List[str]:
+        if self.model is not None and self.current_model_key:
+            return [self.current_model_key]
+        return []
+
+    def get_runtime_state(self) -> Dict[str, Any]:
+        return {
+            "state": "loaded" if self.model is not None and self._ready else "unloaded",
+            "last_error": None,
+        }
 
     def get_config(self) -> dict:
         return self.config

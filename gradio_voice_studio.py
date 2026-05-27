@@ -66,6 +66,27 @@ DEFAULT_REFERENCE_LINE = (
 FALLBACK_VOICES = ["Vivian", "Ryan", "Serena", "Dylan", "Eric", "Aiden"]
 
 
+def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    try:
+        payload = {
+            "sessionId": "35990f",
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(datetime.utcnow().timestamp() * 1000),
+        }
+        httpx.post(
+            "http://127.0.0.1:7852/ingest/d65a6209-8a13-4b06-b1f6-8a0a5aeed5c8",
+            headers={"Content-Type": "application/json", "X-Debug-Session-Id": "35990f"},
+            json=payload,
+            timeout=1.0,
+        )
+    except Exception:
+        pass
+
+
 @dataclass
 class VoiceProfile:
     """Representation of a saved voice profile.
@@ -263,8 +284,10 @@ def request_tts(base_url: str, payload: Dict[str, Any], timeout_s: float) -> Tup
     return r.content, ext
 
 
-def request_tts_voice_clone(base_url: str, payload: Dict[str, Any], timeout_s: float) -> Tuple[bytes, str]:
-    """Call the /v1/audio/voice-clone endpoint (non-streaming) and return audio bytes and extension."""
+def request_tts_voice_clone(
+    base_url: str, payload: Dict[str, Any], timeout_s: float
+) -> Tuple[bytes, str, Dict[str, Any]]:
+    """Call the /v1/audio/voice-clone endpoint (non-streaming). Returns (audio_bytes, extension, headers_dict)."""
     url = normalize_base_url(base_url) + "/v1/audio/voice-clone"
     response_format = payload.get("response_format") or "wav"
     payload["response_format"] = response_format
@@ -274,7 +297,8 @@ def request_tts_voice_clone(base_url: str, payload: Dict[str, Any], timeout_s: f
     ext = response_format.lower()
     if ext == "pcm":
         ext = "raw"
-    return r.content, ext
+    headers = dict(r.headers) if r.headers else {}
+    return r.content, ext, headers
 
 
 def request_tts_streaming(
@@ -331,6 +355,7 @@ def request_tts_streaming(
                             "audio_duration": metadata.get("audio_duration"),
                             "rtf": metadata.get("rtf"),
                             "chunk_count": metadata.get("chunk_count"),
+                            "seed_used": metadata.get("seed_used"),
                         }
                     elif len(audio_bytes) > 0:
                         chunks.append(audio_bytes)
@@ -393,6 +418,65 @@ def export_profiles_zip(library_dir: Path, profile_ids: Optional[List[str]] = No
     return str(zip_path)
 
 
+def import_profiles_zip(library_dir: Path, zip_path: Path) -> Dict[str, Any]:
+    """Import profiles from an export ZIP and return a summary."""
+    if not zip_path.exists():
+        raise ValueError(f"ZIP not found: {zip_path}")
+
+    ensure_dirs(library_dir)
+    imported = 0
+    skipped = 0
+    errors: List[str] = []
+
+    with zipfile.ZipFile(zip_path, "r") as z:
+        names = z.namelist()
+        profile_roots = sorted({n.split("/", 1)[0] for n in names if "/" in n and n != "MANIFEST.json"})
+        for root in profile_roots:
+            meta_name = f"{root}/meta.json"
+            if meta_name not in names:
+                skipped += 1
+                errors.append(f"{root}: missing meta.json")
+                continue
+            try:
+                meta_raw = z.read(meta_name).decode("utf-8")
+                meta = json.loads(meta_raw)
+            except Exception as exc:
+                skipped += 1
+                errors.append(f"{root}: invalid meta.json ({exc})")
+                continue
+
+            try:
+                vp = VoiceProfile(**meta)
+            except Exception as exc:
+                skipped += 1
+                errors.append(f"{root}: invalid profile fields ({exc})")
+                continue
+
+            # Always allocate a fresh profile_id to avoid collisions/overwrites.
+            new_id = safe_profile_id()
+            while profile_dir(library_dir, new_id).exists():
+                new_id = safe_profile_id()
+            old_ref_filename = vp.ref_audio_filename
+            vp.profile_id = new_id
+
+            dest_dir = profile_dir(library_dir, vp.profile_id)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy referenced audio if present in archive.
+            if old_ref_filename:
+                ref_member = f"{root}/{old_ref_filename}"
+                if ref_member in names:
+                    (dest_dir / old_ref_filename).write_bytes(z.read(ref_member))
+                else:
+                    vp.ref_audio_filename = ""
+                    errors.append(f"{root}: referenced audio '{old_ref_filename}' missing in ZIP")
+
+            save_profile(library_dir, vp)
+            imported += 1
+
+    return {"imported": imported, "skipped": skipped, "errors": errors}
+
+
 # -----------------------------------------------------------------------------
 # Gradio UI Construction
 # -----------------------------------------------------------------------------
@@ -401,17 +485,21 @@ def export_profiles_zip(library_dir: Path, profile_ids: Optional[List[str]] = No
 # existing web UI of the Qwen3-TTS server.
 CSS = """
 :root {
-  --bg0: #0b0f19;
-  --bg1: #0f172a;
-  --card: rgba(255,255,255,0.06);
-  --card2: rgba(255,255,255,0.08);
-  --border: rgba(255,255,255,0.10);
+  /* Light-skew palette to match Gradio Soft defaults */
+  --bg0: #f7f8fc;
+  --bg1: #ffffff;
+  --card: rgba(255,255,255,0.95);
+  --card2: rgba(255,255,255,0.98);
+  --border: rgba(15,23,42,0.12);
+  --text: #0f172a;
+  --muted: rgba(15,23,42,0.72);
 }
 body, .gradio-container { background: radial-gradient(1200px 800px at 10% 10%, var(--bg1), var(--bg0)) !important; }
+body, .gradio-container { color: var(--text) !important; color-scheme: light; }
 #header {
   padding: 18px 18px;
   border: 1px solid var(--border);
-  background: linear-gradient(135deg, rgba(99,102,241,0.15), rgba(59,130,246,0.08));
+  background: linear-gradient(135deg, rgba(99,102,241,0.10), rgba(59,130,246,0.06));
   border-radius: 18px;
 }
 .card {
@@ -419,7 +507,16 @@ body, .gradio-container { background: radial-gradient(1200px 800px at 10% 10%, v
   background: var(--card);
   border-radius: 18px;
 }
-.small { opacity: 0.8; font-size: 0.95em; }
+.small { color: var(--muted) !important; font-size: 0.95em; }
+
+/* Keep menus readable without forcing a dark theme */
+.gradio-container label, .gradio-container .label, .gradio-container .wrap label { color: var(--muted) !important; }
+.gradio-container .prose, .gradio-container .markdown, .gradio-container .md { color: var(--text) !important; }
+
+/* Subtle surfaces: do not override Gradio component colors heavily */
+.gradio-container .block, .gradio-container .panel, .gradio-container .gr-box, .gradio-container .wrap {
+  border-color: var(--border) !important;
+}
 """
 
 TABLE_HEADERS = [
@@ -456,7 +553,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
         # Header section
         gr.HTML(
             """
-            <div id=","header">
+            <div id="header">
               <div style="font-size: 1.35rem; font-weight: 700;">Qwen3 Voice Studio</div>
               <div class="small">
                 Create & save reusable voice profiles (preset, designed, or cloned) and export them for inference.
@@ -486,6 +583,22 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
             with gr.Row():
                 refresh_voices_btn = gr.Button("Refresh voices from server", variant="primary")
                 voices_status = gr.Markdown("", elem_classes=["small"])
+            with gr.Row():
+                backend_status_md = gr.Markdown("", elem_classes=["small"])
+            # Backend model (optimized backend only): show when GET /v1/backend/models returns list
+            backend_model_column = gr.Column(visible=False)
+            with backend_model_column:
+                gr.Markdown("**Backend model controls**")
+                backend_model_dropdown = gr.Dropdown(
+                    label="Model",
+                    choices=[],
+                    value=None,
+                )
+                with gr.Row():
+                    switch_model_btn = gr.Button("Load selected model", variant="secondary")
+                    unload_model_btn = gr.Button("Unload model", variant="stop")
+                    refresh_model_status_btn = gr.Button("Refresh model status", variant="secondary")
+                backend_models_status_md = gr.Markdown("", elem_classes=["small"])
 
         # Global log output
         with gr.Row():
@@ -636,6 +749,9 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                             export_selected_btn = gr.Button("Export selected → ZIP", variant="secondary")
                             export_all_btn = gr.Button("Export ALL → ZIP", variant="secondary")
                         export_file = gr.File(label="Export download")
+                        with gr.Row():
+                            import_zip_file = gr.File(label="Import profile ZIP", file_types=[".zip"], type="filepath")
+                            import_zip_btn = gr.Button("Import ZIP", variant="secondary")
                     with gr.Column(scale=1, min_width=340):
                         selected_id = gr.Textbox(label="Selected profile id", placeholder="Click a row to copy id here")
                         load_selected_btn = gr.Button("Load selected", variant="primary")
@@ -645,6 +761,10 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
 
             # Playground tab
             with gr.Tab("Playground"):
+                gr.Markdown(
+                    "**Baseline comparison:** To compare 0.6B vs 1.7B, switch the model in **Settings → Backend model controls**, then run the same text here and check the timing table below.",
+                    elem_classes=["small"],
+                )
                 with gr.Row():
                     with gr.Column(scale=1, min_width=360):
                         play_profile_id = gr.Dropdown(label="Pick a saved profile", choices=[], value=None)
@@ -655,6 +775,13 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                             value="wav",
                         )
                         play_speed = gr.Slider(label="Speed", minimum=0.25, maximum=4.0, value=1.0, step=0.05)
+                        play_seed = gr.Number(
+                            label="Seed (-1 = random)",
+                            value=-1,
+                            precision=0,
+                            minimum=-1,
+                            maximum=2147483647,
+                        )
                         play_generate_btn = gr.Button("🎙️ Generate (Streaming)", variant="primary")
                     with gr.Column(scale=1, min_width=360):
                         play_audio = gr.Audio(label="Output audio (trimmable)", type="filepath", editable=True)
@@ -676,6 +803,216 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                 gr.Dropdown(choices=voices, value=voices[0] if voices else None),
                 f"✅ Loaded {len(voices)} voices from server (or fallback list).",
             )
+
+        def fetch_backend_status(base_url: str):
+            """Fetch /health for quick model verification."""
+            try:
+                url = f"{base_url.rstrip('/')}/health"
+                r = httpx.get(url, timeout=10.0)
+                r.raise_for_status()
+                data = r.json()
+                backend = data.get("backend") or {}
+                name = backend.get("name", "unknown")
+                model_id = backend.get("model_id", "unknown")
+                current_key = backend.get("current_model_key")
+                loaded_models = backend.get("loaded_models") or []
+                runtime = backend.get("runtime") or {}
+                state = runtime.get("state")
+                parts = [f"**Loaded backend:** `{name}`", f"**Model:** `{model_id}`"]
+                if current_key:
+                    parts.append(f"**Current key:** `{current_key}`")
+                if loaded_models:
+                    parts.append(f"**In memory:** `{', '.join(loaded_models)}`")
+                if state:
+                    parts.append(f"**State:** `{state}`")
+                return " | ".join(parts)
+            except Exception as e:
+                return f"⚠️ Could not fetch `/health`: `{e}`"
+
+        def load_backend_models(base_url: str):
+            """Fetch backend model list; show column and dropdown; display loading/error state; enable/disable Generate buttons."""
+            try:
+                run_id = f"ui-models-{int(datetime.utcnow().timestamp() * 1000)}"
+                # region agent log
+                _debug_log(run_id, "H1", "gradio_voice_studio.py:load_backend_models:entry", "load_backend_models entry", {"base_url": base_url})
+                # endregion
+                url = f"{base_url.rstrip('/')}/v1/backend/models"
+                r = httpx.get(url, timeout=10.0)
+                if r.status_code != 200:
+                    # region agent log
+                    _debug_log(run_id, "H2", "gradio_voice_studio.py:load_backend_models:non200", "backend models non-200", {"status_code": r.status_code, "url": url})
+                    # endregion
+                    return (
+                        gr.update(visible=False),
+                        gr.update(choices=[], value=None),
+                        "Model controls are unavailable.",
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                    )
+                data = r.json()
+                available = [m for m in (data.get("available") or []) if "Base" in m]
+                if not available:
+                    # region agent log
+                    _debug_log(run_id, "H3", "gradio_voice_studio.py:load_backend_models:no_base", "no Base models returned", {"available_raw": data.get("available"), "state": data.get("state")})
+                    # endregion
+                    return (
+                        gr.update(visible=False),
+                        gr.update(choices=[], value=None),
+                        "No Base model controls available for this backend.",
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                    )
+                current = data.get("current")
+                loaded = data.get("loaded_models") or []
+                state = data.get("state", "unknown")
+                err = data.get("last_error")
+                runtime = data.get("runtime") or {}
+                last_load_s = runtime.get("last_load_elapsed_s")
+
+                # State line: loading / ready / error
+                if state == "loading":
+                    status_parts = ["**State:** ⏳ Loading… (wait for completion or check logs)"]
+                elif state == "loaded":
+                    status_parts = ["**State:** ✅ Loaded — generation enabled"]
+                elif state == "error":
+                    status_parts = ["**State:** ❌ Error — load a model before generating"]
+                else:
+                    status_parts = [f"**State:** `{state}` — load a model to enable generation"]
+
+                status_parts.append(f"**Selected (dropdown):** `{current or 'none'}`")
+                status_parts.append(f"**In memory:** `{', '.join(loaded) if loaded else 'none'}`")
+                if last_load_s is not None:
+                    status_parts.append(f"**Last load time:** {last_load_s}s")
+                if err:
+                    status_parts.append(f"**Last error:** `{err}`")
+
+                model_ready = state == "loaded"
+                # region agent log
+                _debug_log(
+                    run_id,
+                    "H4",
+                    "gradio_voice_studio.py:load_backend_models:success",
+                    "backend models loaded",
+                    {"state": state, "current": current, "loaded_models": loaded, "model_ready": model_ready, "last_error": err},
+                )
+                # endregion
+                return (
+                    gr.update(visible=True),
+                    gr.update(choices=available, value=current or available[0]),
+                    "\n\n".join(status_parts),
+                    gr.update(interactive=model_ready),
+                    gr.update(interactive=model_ready),
+                )
+            except Exception as e:
+                return (
+                    gr.update(visible=False),
+                    gr.update(choices=[], value=None),
+                    f"⚠️ Failed to load model controls: {e}",
+                    gr.update(interactive=False),
+                    gr.update(interactive=False),
+                )
+
+        def do_switch_backend_model(base_url: str, model_key: Optional[str]):
+            """POST switch model; return updated dropdown, status text, and Generate button interactive state."""
+            if not model_key:
+                return gr.update(), "Select a model first.", gr.update(), gr.update()
+            try:
+                run_id = f"ui-switch-{int(datetime.utcnow().timestamp() * 1000)}"
+                # region agent log
+                _debug_log(run_id, "H5", "gradio_voice_studio.py:do_switch_backend_model:entry", "switch requested", {"base_url": base_url, "model_key": model_key})
+                # endregion
+                url = f"{base_url.rstrip('/')}/v1/backend/models/switch"
+                r = httpx.post(url, json={"model_key": model_key}, timeout=600.0)
+                # region agent log
+                _debug_log(run_id, "H5", "gradio_voice_studio.py:do_switch_backend_model:switch_response", "switch response received", {"status_code": r.status_code})
+                # endregion
+                if r.status_code != 200:
+                    err = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                    msg = err.get("detail", {}).get("message", "Switch failed") if isinstance(err.get("detail"), dict) else str(err.get("detail", "Switch failed"))
+                    raise gr.Error(msg)
+                r2 = httpx.get(f"{base_url.rstrip('/')}/v1/backend/models", timeout=10.0)
+                if r2.status_code != 200:
+                    return gr.update(value=model_key), f"✅ Loaded: `{model_key}`", gr.update(interactive=True), gr.update(interactive=True)
+                data = r2.json()
+                available = [m for m in (data.get("available", []) or []) if "Base" in m]
+                loaded = data.get("loaded_models") or []
+                state = data.get("state", "loaded")
+                model_ready = state == "loaded"
+                msg = f"✅ Loaded: `{data.get('current', model_key)}` | In memory: `{', '.join(loaded) if loaded else 'none'}`"
+                # region agent log
+                _debug_log(run_id, "H4", "gradio_voice_studio.py:do_switch_backend_model:post_status", "post-switch models status", {"state": state, "current": data.get("current", model_key), "loaded_models": loaded})
+                # endregion
+                return (
+                    gr.update(choices=available, value=data.get("current", model_key)),
+                    msg,
+                    gr.update(interactive=model_ready),
+                    gr.update(interactive=model_ready),
+                )
+            except gr.Error:
+                raise
+            except Exception as e:
+                raise gr.Error(str(e))
+
+        def ensure_backend_model(base_url: str, model_key: Optional[str]) -> Optional[str]:
+            """Validate that the selected model is already loaded before generation."""
+            if not model_key:
+                raise gr.Error("Select a model, then click Load selected model before generating.")
+
+            status_url = f"{base_url.rstrip('/')}/v1/backend/models"
+            try:
+                status = httpx.get(status_url, timeout=10.0)
+                if status.status_code != 200:
+                    raise gr.Error(f"Could not verify loaded model: HTTP {status.status_code}")
+                data = status.json()
+            except gr.Error:
+                raise
+            except Exception as e:
+                raise gr.Error(f"Could not verify loaded model: {e}")
+
+            loaded = data.get("loaded_models") or []
+            current = data.get("current")
+            state = data.get("state")
+            if current == model_key and state == "loaded" and model_key in loaded:
+                return model_key
+
+            if state == "unloaded" or not loaded:
+                raise gr.Error(f"`{model_key}` is selected but no model is loaded. Click Load selected model first.")
+            raise gr.Error(
+                f"`{model_key}` is selected but `{current or 'none'}` is loaded. "
+                "Click Load selected model before generating."
+            )
+
+        def on_library_table_select(table: Any, evt: gr.SelectData):
+            """Copy clicked Library id cell into the Selected profile id textbox."""
+            try:
+                row_idx, col_idx = evt.index
+                id_col = TABLE_HEADERS.index("id")
+                if col_idx != id_col:
+                    return gr.update()
+                if evt.value:
+                    return str(evt.value)
+                if hasattr(table, "iloc"):
+                    value = table.iloc[row_idx, id_col]
+                else:
+                    value = table[row_idx][id_col]
+                return str(value) if value is not None else gr.update()
+            except Exception:
+                return gr.update()
+
+        def do_unload_backend_model(base_url: str):
+            """POST unload current backend model; return status and disable Generate buttons."""
+            try:
+                url = f"{base_url.rstrip('/')}/v1/backend/models/unload"
+                r = httpx.post(url, timeout=60.0)
+                if r.status_code != 200:
+                    err = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                    msg = err.get("detail", {}).get("message", "Unload failed") if isinstance(err.get("detail"), dict) else str(err.get("detail", "Unload failed"))
+                    raise gr.Error(msg)
+                return "✅ Model unloaded. In memory: `none` — load a model to enable generation.", gr.update(interactive=False), gr.update(interactive=False)
+            except gr.Error:
+                raise
+            except Exception as e:
+                raise gr.Error(str(e))
 
         def on_generate_preset(base_url: str, timeout_s: float, voice: str, language: str, instructions: str, text: str):
             payload = {
@@ -758,12 +1095,14 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
         def on_generate_clone(
             base_url: str,
             timeout_s: float,
+            selected_model: Optional[str],
             language: str,
             ref_audio_path: str,
             ref_text: str,
             xvec_only: bool,
             text: str,
         ):
+            active_model = ensure_backend_model(base_url, selected_model)
             if not ref_audio_path or not Path(ref_audio_path).exists():
                 raise gr.Error("Reference audio is required.")
             if (not xvec_only) and (not ref_text.strip()):
@@ -799,11 +1138,12 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
 | **Audio duration** | {audio_duration:.2f}s |
 | **RTF** | {rtf:.2f}x |
 | **Chunks** | {chunk_count} |
+| **Model** | {active_model or "current"} |
 """
                 return out_path, out_path, timing_md
             except Exception as e:
                 # Fallback to non-streaming
-                audio_bytes, ext = request_tts_voice_clone(base_url, payload, float(timeout_s))
+                audio_bytes, ext, _headers = request_tts_voice_clone(base_url, payload, float(timeout_s))
                 out_path = write_bytes_to_temp_audio(audio_bytes, ext)
                 return out_path, out_path, f"⚠️ Used non-streaming fallback: {e}"
 
@@ -876,15 +1216,29 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
             zip_path = export_profiles_zip(Path(library_dir_str), profile_ids=None)
             return zip_path, f"✅ Exported: {Path(zip_path).name}"
 
+        def on_import_zip(library_dir_str: str, zip_file_path: Optional[str]):
+            if not zip_file_path:
+                raise gr.Error("Choose a ZIP file first.")
+            summary = import_profiles_zip(Path(library_dir_str), Path(zip_file_path))
+            msg = f"✅ Imported {summary['imported']} profile(s); skipped {summary['skipped']}."
+            if summary["errors"]:
+                msg += f" Issues: {'; '.join(summary['errors'][:3])}"
+                if len(summary["errors"]) > 3:
+                    msg += f" (+{len(summary['errors']) - 3} more)"
+            return msg
+
         def on_play_generate(
             base_url: str,
             timeout_s: float,
+            selected_model: Optional[str],
             library_dir_str: str,
             pid: str,
             text: str,
             fmt: str,
             speed: float,
+            seed: float,
         ):
+            active_model = ensure_backend_model(base_url, selected_model)
             if not pid:
                 raise gr.Error("Pick a saved profile.")
             vp = load_profile(Path(library_dir_str), pid)
@@ -909,6 +1263,8 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                     "task_type": "Base",
                     "voice": vp.voice or "Vivian",
                     "x_vector_only_mode": bool(vp.x_vector_only_mode),
+                    "seed": int(seed) if seed is not None else -1,
+                    "cache_key": vp.profile_id,
                 })
                 if vp.ref_audio_filename:
                     ref_file = profile_dir(Path(library_dir_str), vp.profile_id) / vp.ref_audio_filename
@@ -927,12 +1283,14 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                     audio_bytes, ext, timing_info = request_tts_streaming(base_url, payload, float(timeout_s))
                     out_path = write_bytes_to_temp_audio(audio_bytes, ext)
                     
-                    # Format timing info as readable markdown
-                    first_chunk = timing_info.get('first_chunk_time')
-                    total_time = timing_info.get('total_time')
-                    audio_duration = timing_info.get('audio_duration')
-                    rtf = timing_info.get('rtf')
+                    # Format timing info as readable markdown (include seed used)
+                    first_chunk = timing_info.get('first_chunk_time') or 0.0
+                    total_time = timing_info.get('total_time') or 0.0
+                    audio_duration = timing_info.get('audio_duration') or 0.0
+                    rtf = timing_info.get('rtf') or 0.0
                     chunk_count = timing_info.get('chunk_count', 0)
+                    seed_used = timing_info.get('seed_used')
+                    seed_line = f"| **Seed used** | {seed_used} |\n" if seed_used is not None else ""
                     
                     timing_md = f"""### ⏱️ Generation Timing
 | Metric | Value |
@@ -942,13 +1300,16 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
 | **Audio duration** | {audio_duration:.2f}s |
 | **RTF** | {rtf:.2f}x |
 | **Chunks** | {chunk_count} |
-"""
+| **Model** | {active_model or "current"} |
+{seed_line}"""
                     return out_path, out_path, timing_md
                 except Exception as e:
                     # Fallback to non-streaming voice clone endpoint
-                    audio_bytes, ext = request_tts_voice_clone(base_url, payload, float(timeout_s))
+                    audio_bytes, ext, headers = request_tts_voice_clone(base_url, payload, float(timeout_s))
                     out_path = write_bytes_to_temp_audio(audio_bytes, ext)
-                    return out_path, out_path, f"⚠️ Used non-streaming fallback: {e}"
+                    seed_used = headers.get("x-tts-seed") or headers.get("X-TTS-Seed")
+                    extra = f" Seed used: {seed_used}." if seed_used else ""
+                    return out_path, out_path, f"⚠️ Used non-streaming fallback: {e}{extra}"
             else:
                 payload.update({
                     "task_type": "VoiceDesign",
@@ -967,6 +1328,11 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
             fn=on_refresh_voices,
             inputs=[base_url_in, timeout_in],
             outputs=[state_base_url, state_voices, preset_voice, voices_status],
+        )
+        refresh_voices_btn.click(
+            fn=fetch_backend_status,
+            inputs=[base_url_in],
+            outputs=[backend_status_md],
         )
 
         preset_generate_btn.click(
@@ -993,7 +1359,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
 
         clone_generate_btn.click(
             fn=on_generate_clone,
-            inputs=[base_url_in, timeout_in, clone_language, clone_ref_audio, clone_ref_text, clone_xvec_only, clone_test_text],
+            inputs=[base_url_in, timeout_in, backend_model_dropdown, clone_language, clone_ref_audio, clone_ref_text, clone_xvec_only, clone_test_text],
             outputs=[clone_audio, clone_download, global_log],
         )
         clone_save_btn.click(
@@ -1006,6 +1372,11 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
             fn=on_library_refresh,
             inputs=[library_dir_in],
             outputs=[library_table, play_profile_id],
+        )
+        library_table.select(
+            fn=on_library_table_select,
+            inputs=[library_table],
+            outputs=[selected_id],
         )
         load_selected_btn.click(
             fn=on_load_selected,
@@ -1035,11 +1406,44 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
 
         play_generate_btn.click(
             fn=on_play_generate,
-            inputs=[base_url_in, timeout_in, library_dir_in, play_profile_id, play_text, play_response_format, play_speed],
+            inputs=[base_url_in, timeout_in, backend_model_dropdown, library_dir_in, play_profile_id, play_text, play_response_format, play_speed, play_seed],
             outputs=[play_audio, play_download, play_timing],
         )
 
         demo.load(fn=on_library_refresh, inputs=[library_dir_in], outputs=[library_table, play_profile_id])
+        demo.load(
+            fn=load_backend_models,
+            inputs=[base_url_in],
+            outputs=[backend_model_column, backend_model_dropdown, backend_models_status_md, play_generate_btn, clone_generate_btn],
+        )
+        switch_model_btn.click(
+            fn=do_switch_backend_model,
+            inputs=[base_url_in, backend_model_dropdown],
+            outputs=[backend_model_dropdown, backend_models_status_md, play_generate_btn, clone_generate_btn],
+        )
+        unload_model_btn.click(
+            fn=do_unload_backend_model,
+            inputs=[base_url_in],
+            outputs=[backend_models_status_md, play_generate_btn, clone_generate_btn],
+        ).then(
+            fn=load_backend_models,
+            inputs=[base_url_in],
+            outputs=[backend_model_column, backend_model_dropdown, backend_models_status_md, play_generate_btn, clone_generate_btn],
+        )
+        refresh_model_status_btn.click(
+            fn=load_backend_models,
+            inputs=[base_url_in],
+            outputs=[backend_model_column, backend_model_dropdown, backend_models_status_md, play_generate_btn, clone_generate_btn],
+        )
+        import_zip_btn.click(
+            fn=on_import_zip,
+            inputs=[library_dir_in, import_zip_file],
+            outputs=[global_log],
+        ).then(
+            fn=on_library_refresh,
+            inputs=[library_dir_in],
+            outputs=[library_table, play_profile_id],
+        )
 
     return demo
 

@@ -7,7 +7,6 @@ This backend uses the official Qwen3-TTS Python implementation
 from the qwen_tts package.
 """
 
-import asyncio
 import logging
 import re
 from pathlib import Path
@@ -185,9 +184,8 @@ class OfficialQwen3TTSBackend(TTSBackend):
             await self.initialize()
         
         try:
-            # Offload blocking model call to a thread so the event loop stays responsive
-            wavs, sr = await asyncio.to_thread(
-                self.model.generate_custom_voice,
+            # Generate speech
+            wavs, sr = self.model.generate_custom_voice(
                 text=text,
                 language=language,
                 speaker=voice,
@@ -322,6 +320,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
         language: str = "Auto",
         x_vector_only_mode: bool = False,
         speed: float = 1.0,
+        seed: Optional[int] = -1,
     ) -> Tuple[np.ndarray, int]:
         """
         Generate speech by cloning a voice from reference audio.
@@ -334,6 +333,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
             language: Language code (e.g., "English", "Chinese", "Auto")
             x_vector_only_mode: If True, use x-vector only (no ref_text needed)
             speed: Speech speed multiplier (0.25 to 4.0)
+            seed: Random seed; -1 or None for random (passed through for API compatibility).
 
         Returns:
             Tuple of (audio_array, sample_rate)
@@ -348,9 +348,9 @@ class OfficialQwen3TTSBackend(TTSBackend):
             )
 
         try:
-            # Offload blocking model call to a thread so the event loop stays responsive
-            wavs, sr = await asyncio.to_thread(
-                self.model.generate_voice_clone,
+            # Call the model's voice cloning method
+            # ref_audio expects a tuple of (waveform, sample_rate)
+            wavs, sr = self.model.generate_voice_clone(
                 text=text,
                 ref_audio=(ref_audio, ref_audio_sr),
                 ref_text=ref_text,
@@ -501,8 +501,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
             raise RuntimeError(f"Custom voice '{voice}' not found")
 
         try:
-            wavs, sr = await asyncio.to_thread(
-                self.model.generate_voice_clone,
+            wavs, sr = self.model.generate_voice_clone(
                 text=text,
                 language=language,
                 voice_clone_prompt=prompt_items,
@@ -531,6 +530,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
         language: str = "Auto",
         x_vector_only_mode: bool = False,
         speed: float = 1.0,
+        seed: Optional[int] = -1,
         emit_every_frames: int = 4,
         decode_window_frames: int = 80,
     ):
@@ -548,6 +548,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
             language: Language code (e.g., "English", "Chinese", "Auto")
             x_vector_only_mode: If True, use x-vector only (no ref_text needed)
             speed: Speech speed multiplier (0.25 to 4.0)
+            seed: Random seed; -1 or None for random (passed through for API compatibility).
             emit_every_frames: Emit audio chunk every N codec frames (lower = lower latency)
             decode_window_frames: Decode window size in frames (larger = better quality)
 

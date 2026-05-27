@@ -114,6 +114,7 @@ class TTSBackend(ABC):
         language: str = "Auto",
         x_vector_only_mode: bool = False,
         speed: float = 1.0,
+        seed: Optional[int] = -1,
     ) -> Tuple[np.ndarray, int]:
         """
         Generate speech by cloning a voice from reference audio.
@@ -126,6 +127,7 @@ class TTSBackend(ABC):
             language: Language code (e.g., "English", "Chinese", "Auto")
             x_vector_only_mode: If True, use x-vector only (no ref_text needed)
             speed: Speech speed multiplier (0.25 to 4.0)
+            seed: Random seed; -1 or None for random.
 
         Returns:
             Tuple of (audio_array, sample_rate)
