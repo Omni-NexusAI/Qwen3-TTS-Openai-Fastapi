@@ -1073,18 +1073,23 @@ async def create_voice_clone(
             else random.randint(0, 2**31 - 1)
         )
 
-        # Generate voice clone
-        audio, sample_rate = await backend.generate_voice_clone(
-            text=normalized_text,
-            ref_audio=ref_audio,
-            ref_audio_sr=ref_sr,
-            ref_text=request.ref_text,
-            language=request.language or "Auto",
-            x_vector_only_mode=request.x_vector_only_mode,
-            speed=request.speed,
-            seed=seed_used,
-            **({"cache_key": request.cache_key} if request.cache_key and _method_accepts_kwarg(backend.generate_voice_clone, "cache_key") else {}),
-        )
+        clone_kwargs = {
+            "text": normalized_text,
+            "ref_audio": ref_audio,
+            "ref_audio_sr": ref_sr,
+            "ref_text": request.ref_text,
+            "language": request.language or "Auto",
+            "x_vector_only_mode": request.x_vector_only_mode,
+        }
+        if _method_accepts_kwarg(backend.generate_voice_clone, "speed"):
+            clone_kwargs["speed"] = request.speed
+        if _method_accepts_kwarg(backend.generate_voice_clone, "seed"):
+            clone_kwargs["seed"] = seed_used
+        if request.cache_key and _method_accepts_kwarg(backend.generate_voice_clone, "cache_key"):
+            clone_kwargs["cache_key"] = request.cache_key
+
+        # Generate voice clone without passing unsupported backend kwargs.
+        audio, sample_rate = await backend.generate_voice_clone(**clone_kwargs)
 
         # Encode audio to requested format
         audio_bytes = encode_audio(audio, request.response_format, sample_rate)

@@ -954,37 +954,50 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                 raise gr.Error(str(e))
 
         def ensure_backend_model(base_url: str, model_key: Optional[str]) -> Optional[str]:
-            """Make the dropdown selection authoritative before generation."""
+            """Validate that the selected model is already loaded before generation."""
             if not model_key:
-                return None
-            try:
-                status_url = f"{base_url.rstrip('/')}/v1/backend/models"
-                status = httpx.get(status_url, timeout=10.0)
-                if status.status_code == 200:
-                    data = status.json()
-                    loaded = data.get("loaded_models") or []
-                    if (
-                        data.get("current") == model_key
-                        and data.get("state") == "loaded"
-                        and model_key in loaded
-                    ):
-                        return model_key
-            except Exception:
-                pass
+                raise gr.Error("Select a model, then click Load selected model before generating.")
 
-            switch_url = f"{base_url.rstrip('/')}/v1/backend/models/switch"
-            r = httpx.post(switch_url, json={"model_key": model_key}, timeout=600.0)
-            if r.status_code != 200:
-                try:
-                    detail = r.json().get("detail")
-                    if isinstance(detail, dict):
-                        message = detail.get("message") or str(detail)
-                    else:
-                        message = str(detail)
-                except Exception:
-                    message = r.text
-                raise gr.Error(f"Could not load `{model_key}`: {message}")
-            return model_key
+            status_url = f"{base_url.rstrip('/')}/v1/backend/models"
+            try:
+                status = httpx.get(status_url, timeout=10.0)
+                if status.status_code != 200:
+                    raise gr.Error(f"Could not verify loaded model: HTTP {status.status_code}")
+                data = status.json()
+            except gr.Error:
+                raise
+            except Exception as e:
+                raise gr.Error(f"Could not verify loaded model: {e}")
+
+            loaded = data.get("loaded_models") or []
+            current = data.get("current")
+            state = data.get("state")
+            if current == model_key and state == "loaded" and model_key in loaded:
+                return model_key
+
+            if state == "unloaded" or not loaded:
+                raise gr.Error(f"`{model_key}` is selected but no model is loaded. Click Load selected model first.")
+            raise gr.Error(
+                f"`{model_key}` is selected but `{current or 'none'}` is loaded. "
+                "Click Load selected model before generating."
+            )
+
+        def on_library_table_select(table: Any, evt: gr.SelectData):
+            """Copy clicked Library id cell into the Selected profile id textbox."""
+            try:
+                row_idx, col_idx = evt.index
+                id_col = TABLE_HEADERS.index("id")
+                if col_idx != id_col:
+                    return gr.update()
+                if evt.value:
+                    return str(evt.value)
+                if hasattr(table, "iloc"):
+                    value = table.iloc[row_idx, id_col]
+                else:
+                    value = table[row_idx][id_col]
+                return str(value) if value is not None else gr.update()
+            except Exception:
+                return gr.update()
 
         def do_unload_backend_model(base_url: str):
             """POST unload current backend model; return status and disable Generate buttons."""
@@ -1360,6 +1373,11 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
             inputs=[library_dir_in],
             outputs=[library_table, play_profile_id],
         )
+        library_table.select(
+            fn=on_library_table_select,
+            inputs=[library_table],
+            outputs=[selected_id],
+        )
         load_selected_btn.click(
             fn=on_load_selected,
             inputs=[library_dir_in, selected_id],
@@ -1399,11 +1417,6 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
             outputs=[backend_model_column, backend_model_dropdown, backend_models_status_md, play_generate_btn, clone_generate_btn],
         )
         switch_model_btn.click(
-            fn=do_switch_backend_model,
-            inputs=[base_url_in, backend_model_dropdown],
-            outputs=[backend_model_dropdown, backend_models_status_md, play_generate_btn, clone_generate_btn],
-        )
-        backend_model_dropdown.change(
             fn=do_switch_backend_model,
             inputs=[base_url_in, backend_model_dropdown],
             outputs=[backend_model_dropdown, backend_models_status_md, play_generate_btn, clone_generate_btn],

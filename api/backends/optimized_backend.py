@@ -96,6 +96,21 @@ class OptimizedQwen3TTSBackend(TTSBackend):
     def _model_info(self, model_key: str) -> dict:
         return self.config.get("models", {}).get(model_key, {})
 
+    def _require_loaded_base_model(self) -> str:
+        """Return the active Base model key, or fail without loading anything."""
+        if self.model is None or not self._ready or not self.current_model_key:
+            raise RuntimeError(
+                "No Base model is loaded. Select a Base model and click "
+                "Load selected model before generating."
+            )
+        model_type = self._model_info(self.current_model_key).get("type")
+        if model_type != "base":
+            raise RuntimeError(
+                f"Loaded model '{self.current_model_key}' is not a Base model. "
+                "Load a Base model before voice cloning."
+            )
+        return self.current_model_key
+
     async def _ensure_model_loaded(self, model_key: str) -> None:
         """Load *model_key* if it is not the currently active model."""
         import torch
@@ -405,8 +420,8 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         speed: float = 1.0,
         cache_key: Optional[str] = None,
     ) -> Tuple[np.ndarray, int]:
-        """Non-streaming voice cloning (uses Base model)."""
-        await self._ensure_model_loaded(self._base_model_key())
+        """Non-streaming voice cloning using the already-loaded Base model."""
+        self._require_loaded_base_model()
 
         t0 = time.time()
 
@@ -468,11 +483,11 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         cache_key: Optional[str] = None,
     ) -> AsyncGenerator[Tuple[np.ndarray, int], None]:
         """
-        Real token-by-token streaming voice cloning (uses Base model).
+        Real token-by-token streaming voice cloning using the loaded Base model.
 
         Yields (pcm_chunk, sample_rate) tuples as the model generates audio.
         """
-        await self._ensure_model_loaded(self._base_model_key())
+        self._require_loaded_base_model()
 
         streaming_opts = self.config.get("optimization", {}).get("streaming", {})
         decode_window_frames = streaming_opts.get("decode_window_frames", 80)
@@ -537,7 +552,7 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         return True
 
     def get_model_type(self) -> str:
-        if not self.current_model_key:
+        if self.model is None or not self.current_model_key:
             return "unknown"
         return self._model_info(self.current_model_key).get("type", "unknown")
 
