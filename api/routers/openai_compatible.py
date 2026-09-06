@@ -29,7 +29,6 @@ from ..structures.schemas import (
     VoiceCloneRequest,
     VoiceCloneCapabilities,
     StreamingVoiceCloneRequest,
-    TimingInfo,
 )
 from ..services.text_processing import normalize_text
 from ..services.audio_encoding import encode_audio, get_content_type, DEFAULT_SAMPLE_RATE
