@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -43,6 +44,98 @@ except ValueError:
     logger.warning("Invalid TTS_MAX_CONCURRENT value; falling back to 1")
     _MAX_CONCURRENT = 1
 _generation_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+
+# --- Auto-chunking -----------------------------------------------------------
+# Input is split at punctuation into chunks sized to a [min, max] character
+# window, each synthesized separately and the audio concatenated back together.
+# This keeps every generation well under the backend's wall-clock cap (and below
+# the mlx-audio 0.3.x graph-compile hang threshold for long sequences), and
+# lowers first-audio latency. Inputs that fit in a single chunk take the
+# original code path with zero overhead.
+#
+# Splitting prefers sentence punctuation (. ! ?), then clause punctuation
+# (, ; :), then word boundaries. Chunks are packed greedily up to max_chars and
+# kept at/above min_chars where possible (a too-small piece is merged with a
+# neighbour as long as the result still fits within max_chars).
+#   TTS_AUTOCHUNK=false        disable entirely
+#   TTS_MIN_CHUNK_CHARS=20     soft lower bound per chunk
+#   TTS_MAX_CHUNK_CHARS=70     hard upper bound per chunk
+#   TTS_CHUNK_GAP_MS=120       silence inserted between merged chunks
+try:
+    _AUTOCHUNK = os.getenv("TTS_AUTOCHUNK", "true").lower() == "true"
+    _MIN_CHUNK_CHARS = max(1, int(os.getenv("TTS_MIN_CHUNK_CHARS", "20")))
+    _MAX_CHUNK_CHARS = max(_MIN_CHUNK_CHARS, int(os.getenv("TTS_MAX_CHUNK_CHARS", "70")))
+    _CHUNK_GAP_MS = max(0, int(os.getenv("TTS_CHUNK_GAP_MS", "120")))
+except ValueError:
+    logger.warning("Invalid auto-chunk env value; using defaults")
+    _AUTOCHUNK, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS = True, 20, 70, 120
+
+
+def _pieces(text: str, max_chars: int) -> List[str]:
+    """Break text into pieces each <= max_chars, splitting on sentence
+    punctuation (. ! ?), then clause punctuation (, ; :), then words."""
+    out: List[str] = []
+    for sent in re.split(r"(?<=[.!?])\s+", text.strip()):
+        sent = sent.strip()
+        if not sent:
+            continue
+        if len(sent) <= max_chars:
+            out.append(sent)
+            continue
+        for clause in re.split(r"(?<=[,;:])\s+", sent):
+            clause = clause.strip()
+            if not clause:
+                continue
+            if len(clause) <= max_chars:
+                out.append(clause)
+                continue
+            buf = ""
+            for w in clause.split():
+                if not buf:
+                    buf = w
+                elif len(buf) + 1 + len(w) <= max_chars:
+                    buf += " " + w
+                else:
+                    out.append(buf)
+                    buf = w
+            if buf:
+                out.append(buf)
+    return out
+
+
+def _split_into_chunks(text: str, min_chars: int, max_chars: int) -> List[str]:
+    """Split text into chunks within a [min_chars, max_chars] window, breaking
+    at punctuation. Pieces are packed greedily up to max_chars; a chunk shorter
+    than min_chars is merged into a neighbour when the result still fits."""
+    pieces = _pieces(text, max_chars)
+    if not pieces:
+        return []
+    # Greedy pack up to max_chars.
+    chunks: List[str] = []
+    buf = ""
+    for p in pieces:
+        if not buf:
+            buf = p
+        elif len(buf) + 1 + len(p) <= max_chars:
+            buf += " " + p
+        else:
+            chunks.append(buf)
+            buf = p
+    if buf:
+        chunks.append(buf)
+    # Soft minimum: fold an undersized chunk into a neighbour if it still fits.
+    merged: List[str] = []
+    for c in chunks:
+        if (
+            merged
+            and (len(c) < min_chars or len(merged[-1]) < min_chars)
+            and len(merged[-1]) + 1 + len(c) <= max_chars
+        ):
+            merged[-1] = merged[-1] + " " + c
+        else:
+            merged.append(c)
+    return [c for c in merged if c.strip()]
+# -----------------------------------------------------------------------------
 
 # Voice library: saved voice profiles used via the "clone:ProfileName" voice prefix.
 # Configurable via VOICE_LIBRARY_DIR env var; defaults to ./voice_library.
@@ -208,15 +301,45 @@ def _load_voice_profile(name_or_id: str) -> dict:
 
 
 async def get_tts_backend():
-    """Get the TTS backend instance, initializing if needed."""
+    """Get the TTS backend instance, initializing if needed.
+
+    Honors lazy-load: if the backend hasn't been initialized yet, the
+    first caller pays the model-load + warmup cost in one shot. The
+    warmup is gated by the ``TTS_WARMUP_ON_START`` env var (which the
+    factory re-reads on each call). This is critical for the MLX
+    backend — the cold graph compile can wedge mlx-audio 0.3.x, and
+    warmup absorbs that cost at first-load time instead of on the
+    user's first request.
+    """
     from ..backends import get_backend, initialize_backend
-    
+
     backend = get_backend()
-    
+
     if not backend.is_ready():
-        await initialize_backend()
-    
+        warmup_enabled = os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true"
+        await initialize_backend(warmup=warmup_enabled)
+
     return backend
+
+
+def note_speech_activity(app, samples: int = 0) -> None:
+    """Reset the idle-shutdown timer on a successful speech request.
+
+    Called from the /v1/audio/speech handler. Read-only endpoints
+    like /health do NOT call this, so they don't keep a quiet
+    server alive forever.
+
+    Args:
+        app: The FastAPI app instance (``request.app`` from the route).
+        samples: Number of audio samples generated, for stats.
+    """
+    import time as _time
+    state = getattr(app, "state", None)
+    if state is None:
+        return
+    state.last_speech_at = _time.monotonic()
+    state.speech_request_count = getattr(state, "speech_request_count", 0) + 1
+    state.speech_total_samples = getattr(state, "speech_total_samples", 0) + int(samples)
 
 
 def get_voice_name(voice: str) -> str:
@@ -268,33 +391,62 @@ async def generate_speech(
 
     # Check custom voice BEFORE applying OpenAI alias mapping,
     # so custom voices with OpenAI alias names remain accessible.
-    if backend.is_custom_voice(voice):
-        try:
-            audio, sr = await backend.generate_speech_with_custom_voice(
-                text=text,
+    is_custom = backend.is_custom_voice(voice)
+    # Map voice name (OpenAI aliases to internal names) for built-in voices.
+    voice_name = voice if is_custom else get_voice_name(voice)
+
+    async def _synth(segment: str) -> tuple[np.ndarray, int]:
+        if is_custom:
+            return await backend.generate_speech_with_custom_voice(
+                text=segment,
                 voice=voice,
                 language=language,
                 speed=speed,
             )
-            return audio, sr
-        except Exception as e:
-            raise RuntimeError(f"Speech generation failed: {e}")
-
-    # Map voice name (OpenAI aliases to internal names)
-    voice_name = get_voice_name(voice)
-    
-    # Generate speech using the backend
-    try:
-        audio, sr = await backend.generate_speech(
-            text=text,
+        return await backend.generate_speech(
+            text=segment,
             voice=voice_name,
             language=language,
             instruct=instruct,
             speed=speed,
         )
-        
-        return audio, sr
-        
+
+    # Decide chunking. A single chunk (or disabled) takes the original path.
+    chunks = (
+        _split_into_chunks(text, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS)
+        if _AUTOCHUNK else [text]
+    )
+    if len(chunks) <= 1:
+        try:
+            return await _synth(text)
+        except Exception as e:
+            raise RuntimeError(f"Speech generation failed: {e}")
+
+    # Multi-chunk: synthesize each sentence-group, then merge with a short gap.
+    logger.info(
+        "Auto-chunking %d chars into %d chunks (window=%d-%d)",
+        len(text), len(chunks), _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS,
+    )
+    try:
+        audios: List[np.ndarray] = []
+        sr = DEFAULT_SAMPLE_RATE
+        for i, seg in enumerate(chunks):
+            a, sr = await _synth(seg)
+            if a is not None and len(a):
+                audios.append(np.asarray(a))
+        if not audios:
+            raise RuntimeError("no audio produced from any chunk")
+        gap_len = int(sr * _CHUNK_GAP_MS / 1000.0)
+        gap = (
+            np.zeros(gap_len, dtype=audios[0].dtype)
+            if gap_len > 0 else None
+        )
+        merged: List[np.ndarray] = []
+        for i, a in enumerate(audios):
+            if i and gap is not None:
+                merged.append(gap)
+            merged.append(a)
+        return np.concatenate(merged), sr
     except Exception as e:
         raise RuntimeError(f"Speech generation failed: {e}")
 
@@ -609,6 +761,14 @@ async def create_speech(
                         f"TTS stream done: total={gen_time:.2f}s "
                         f"audio={audio_dur:.2f}s RTF={rtf:.2f}x chunks={chunk_count}"
                     )
+                    # Reset the idle-shutdown timer for this in-process
+                    # server. We do this on the streaming path's
+                    # natural completion so the timer only resets on
+                    # a real successful generation.
+                    try:
+                        note_speech_activity(client_request.app, samples=total_samples)
+                    except Exception:
+                        pass
 
                 return StreamingResponse(
                     _speech_stream(),
@@ -632,6 +792,14 @@ async def create_speech(
                 instruct=request.instruct,
                 speed=request.speed,
             )
+
+            # Reset the idle-shutdown timer for this in-process
+            # server. Read-only endpoints like /health do not touch
+            # this, so a quiet server self-terminates.
+            try:
+                note_speech_activity(client_request.app, samples=len(audio))
+            except Exception:
+                pass
 
         # Get content type
         content_type = get_content_type(request.response_format)
