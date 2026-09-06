@@ -39,3 +39,5 @@ output/
 
 # LLM infra
 CLAUDE.md
+# Runtime server logs
+server_*.log

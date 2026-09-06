@@ -1,102 +1,107 @@
 # coding=utf-8
 # SPDX-License-Identifier: Apache-2.0
-"""
-Factory for creating TTS backend instances.
-"""
+"""Factory and lifecycle management for Qwen3-TTS backends."""
 
-import os
+from __future__ import annotations
+
+import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
 from .base import TTSBackend
-from .official_qwen3_tts import OfficialQwen3TTSBackend
-from .vllm_omni_qwen3_tts import VLLMOmniQwen3TTSBackend
-from .pytorch_backend import PyTorchCPUBackend
-from .openvino_backend import OpenVINOBackend
 
 logger = logging.getLogger(__name__)
 
-# Global backend instance
+_DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+_DEFAULT_CPU_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 _backend_instance: Optional[TTSBackend] = None
+_initialization_lock: Optional[asyncio.Lock] = None
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, raw, default)
+        return default
+    if value < minimum:
+        logger.warning("%s must be >= %d; using %d", name, minimum, default)
+        return default
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float = 0.001) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.3f", name, raw, default)
+        return default
+    if value < minimum:
+        logger.warning("%s must be >= %.3f; using %.3f", name, minimum, default)
+        return default
+    return value
+
+
+def _get_initialization_lock() -> asyncio.Lock:
+    global _initialization_lock
+    if _initialization_lock is None:
+        _initialization_lock = asyncio.Lock()
+    return _initialization_lock
 
 
 def get_backend() -> TTSBackend:
-    """
-    Get or create the global TTS backend instance.
-    
-    The backend is selected based on the TTS_BACKEND environment variable:
-    - "optimized": Optimized backend with torch.compile, CUDA graphs, dynamic model switching, and real-time streaming
-    - "official" (default): Use official Qwen3-TTS implementation (GPU/CPU auto-detect)
-    - "vllm_omni": Use vLLM-Omni for faster inference
-    - "pytorch": CPU-optimized PyTorch backend
-    - "openvino": Experimental OpenVINO backend for Intel CPUs
-    
-    Returns:
-        TTSBackend instance
-    """
+    """Return the process-wide backend instance, creating it lazily."""
     global _backend_instance
-    
     if _backend_instance is not None:
         return _backend_instance
-    
-    # Read configuration from environment variables directly to support testing
-    backend_type = os.getenv("TTS_BACKEND", "official").lower()
-    model_name = os.getenv("TTS_MODEL_NAME", os.getenv("TTS_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"))
-    
-    # Device and dtype settings
-    device = os.getenv("TTS_DEVICE", "auto")
-    dtype = os.getenv("TTS_DTYPE", "auto")
-    attn = os.getenv("TTS_ATTN", "auto")
-    
-    # CPU settings
-    cpu_threads = int(os.getenv("CPU_THREADS", "12"))
-    cpu_interop = int(os.getenv("CPU_INTEROP", "2"))
-    use_ipex = os.getenv("USE_IPEX", "false").lower() == "true"
-    
-    # OpenVINO settings
-    ov_device = os.getenv("OV_DEVICE", "CPU")
+
+    backend_type = os.getenv("TTS_BACKEND", "official").strip().lower()
+    configured_model = os.getenv("TTS_MODEL_NAME") or os.getenv("TTS_MODEL_ID")
+    model_name = (configured_model or _DEFAULT_MODEL).strip()
+
+    device = os.getenv("TTS_DEVICE", "auto").strip() or "auto"
+    dtype = os.getenv("TTS_DTYPE", "auto").strip() or "auto"
+    attn = os.getenv("TTS_ATTN", "auto").strip() or "auto"
+    cpu_threads = _env_int("CPU_THREADS", 12)
+    cpu_interop = _env_int("CPU_INTEROP", 2)
+    use_ipex = os.getenv("USE_IPEX", "false").strip().lower() == "true"
+    ov_device = os.getenv("OV_DEVICE", "CPU").strip() or "CPU"
     ov_cache_dir = os.getenv("OV_CACHE_DIR", "./.ov_cache")
     ov_model_dir = os.getenv("OV_MODEL_DIR", "./.ov_models")
-    
-    logger.info(f"Initializing TTS backend: {backend_type}")
-    
-    if backend_type == "optimized":
-        # Optimized backend: torch.compile, CUDA graphs, model switching, streaming
-        from .optimized_backend import OptimizedQwen3TTSBackend
-        _backend_instance = OptimizedQwen3TTSBackend()
-        logger.info("Using optimized Qwen3-TTS backend")
 
+    logger.info("Creating TTS backend: %s", backend_type)
+
+    # Imports are deliberately local. Optional backends must not make the
+    # default installation fail merely because their dependencies are absent.
+    if backend_type == "optimized":
+        from .optimized_backend import OptimizedQwen3TTSBackend
+
+        _backend_instance = OptimizedQwen3TTSBackend()
     elif backend_type == "official":
-        # Official backend (GPU/CPU auto-detect)
-        if model_name:
-            _backend_instance = OfficialQwen3TTSBackend(model_name=model_name)
-        else:
-            # Use default CustomVoice model
-            _backend_instance = OfficialQwen3TTSBackend()
-        
-        logger.info(f"Using official Qwen3-TTS backend with model: {_backend_instance.get_model_id()}")
-    
-    elif backend_type == "vllm_omni" or backend_type == "vllm-omni" or backend_type == "vllm":
-        # vLLM-Omni backend
-        if model_name:
-            _backend_instance = VLLMOmniQwen3TTSBackend(model_name=model_name)
-        else:
-            # Use 1.7B model for best quality/speed tradeoff
-            _backend_instance = VLLMOmniQwen3TTSBackend(
-                model_name="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-            )
-        
-        logger.info(f"Using vLLM-Omni backend with model: {_backend_instance.get_model_id()}")
-    
+        from .official_qwen3_tts import OfficialQwen3TTSBackend
+
+        _backend_instance = OfficialQwen3TTSBackend(model_name=model_name)
+    elif backend_type in {"vllm_omni", "vllm-omni", "vllm"}:
+        from .vllm_omni_qwen3_tts import VLLMOmniQwen3TTSBackend
+
+        _backend_instance = VLLMOmniQwen3TTSBackend(model_name=model_name)
     elif backend_type == "pytorch":
-        # CPU-optimized PyTorch backend
+        from .pytorch_backend import PyTorchCPUBackend
+
         device_val = device if device != "auto" else "cpu"
         dtype_val = dtype if dtype != "auto" else "float32"
         attn_val = attn if attn != "auto" else "sdpa"
-        
+        cpu_model_name = (configured_model or _DEFAULT_CPU_MODEL).strip()
         _backend_instance = PyTorchCPUBackend(
-            model_id=model_name,
+            model_id=cpu_model_name,
             device=device_val,
             dtype=dtype_val,
             attn_implementation=attn_val,
@@ -104,100 +109,159 @@ def get_backend() -> TTSBackend:
             cpu_interop_threads=cpu_interop,
             use_ipex=use_ipex,
         )
-        
-        logger.info(f"Using CPU-optimized PyTorch backend with model: {_backend_instance.get_model_id()}")
-        logger.info(f"Device: {device_val}, Dtype: {dtype_val}, Attention: {attn_val}")
-        logger.info(f"CPU Threads: {cpu_threads}, Interop: {cpu_interop}, IPEX: {use_ipex}")
-    
+        logger.info(
+            "PyTorch backend: device=%s dtype=%s attention=%s threads=%d interop=%d ipex=%s",
+            device_val,
+            dtype_val,
+            attn_val,
+            cpu_threads,
+            cpu_interop,
+            use_ipex,
+        )
     elif backend_type == "openvino":
-        # Experimental OpenVINO backend
+        from .openvino_backend import OpenVINOBackend
+
         _backend_instance = OpenVINOBackend(
             ov_model_dir=ov_model_dir,
             ov_device=ov_device,
             ov_cache_dir=ov_cache_dir,
         )
-        
-        logger.info(f"Using experimental OpenVINO backend")
-        logger.info(f"Model dir: {ov_model_dir}, Device: {ov_device}")
         logger.warning(
-            "OpenVINO backend is experimental and requires manual model export. "
-            "For reliable CPU inference, use TTS_BACKEND=pytorch instead."
+            "OpenVINO is experimental and requires a manually exported model; "
+            "use TTS_BACKEND=pytorch for the reliable CPU path."
         )
-    
+    elif backend_type == "mlx":
+        from .mlx_qwen3_tts import DEFAULT_MLX_MODEL, MLXQwen3TTSBackend
+
+        mlx_model_name = os.getenv("MLX_MODEL_ID", DEFAULT_MLX_MODEL).strip()
+        _backend_instance = MLXQwen3TTSBackend(
+            model_name=mlx_model_name or DEFAULT_MLX_MODEL
+        )
     else:
-        logger.error(f"Unknown backend type: {backend_type}")
         raise ValueError(
-            f"Unknown TTS_BACKEND: {backend_type}. "
-            f"Supported values: 'optimized', 'official', 'vllm_omni', 'pytorch', 'openvino'"
+            f"Unknown TTS_BACKEND: {backend_type!r}. Supported values: "
+            "optimized, official, vllm_omni, pytorch, openvino, mlx"
         )
-    
+
+    logger.info(
+        "Using %s backend with model %s",
+        _backend_instance.get_backend_name(),
+        _backend_instance.get_model_id(),
+    )
     return _backend_instance
 
 
-async def initialize_backend(warmup: bool = False) -> TTSBackend:
-    """
-    Initialize the backend and optionally perform warmup.
-    
-    Args:
-        warmup: Whether to run a warmup inference
-    
-    Returns:
-        Initialized TTSBackend instance
-    """
-    backend = get_backend()
+async def _run_warmup_request(backend: TTSBackend, text: str) -> None:
+    custom_names = backend.get_custom_voice_names()
+    if backend.get_model_type() == "base" and custom_names:
+        await backend.generate_speech_with_custom_voice(
+            text=text,
+            voice=custom_names[0],
+            language="English",
+        )
+    elif backend.get_model_type() == "base":
+        raise LookupError("Base model has no custom voice available for warmup")
+    else:
+        await backend.generate_speech(
+            text=text,
+            voice="Vivian",
+            language="English",
+        )
 
-    # Initialize the backend
-    await backend.initialize()
 
-    # Load custom voices
-    custom_voices_dir = os.getenv(
-        "TTS_CUSTOM_VOICES",
-        str(Path(__file__).resolve().parent.parent.parent / "custom_voices"),
+async def _warmup_backend(backend: TTSBackend) -> None:
+    """Warm both regular and streaming paths with real wall-clock timeouts."""
+    import time
+
+    max_seconds = _env_float("TTS_WARMUP_MAX_SECONDS", 10.0)
+    texts = [
+        "Hello.",
+        "Hello, this is a warmup test.",
+        "Hello, this is a longer warmup test to exercise the full decode pipeline.",
+    ]
+
+    logger.info(
+        "Performing backend warmup (%d requests, %.1fs timeout each)",
+        len(texts),
+        max_seconds,
     )
-    try:
-        await backend.load_custom_voices(custom_voices_dir)
-    except Exception as e:
-        logger.warning(f"Custom voice loading failed (non-critical): {e}")
+    for index, text in enumerate(texts, 1):
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                _run_warmup_request(backend, text), timeout=max_seconds
+            )
+        except LookupError as exc:
+            logger.info("Skipping warmup: %s", exc)
+            return
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Warmup request {index} exceeded {max_seconds:.1f}s"
+            ) from exc
+        logger.info(
+            "Warmup request %d/%d completed in %.2fs",
+            index,
+            len(texts),
+            time.monotonic() - started,
+        )
 
-    # Perform warmup if requested
-    if warmup:
-        warmup_enabled = os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true"
-        if warmup_enabled:
-            logger.info("Performing backend warmup (3 requests)...")
-            # Use progressively longer texts so both LM decode paths and
-            # audio decoder CUDA graphs are exercised before real traffic hits.
-            _warmup_texts = [
-                "Hello.",
-                "Hello, this is a warmup test.",
-                "Hello, this is a longer warmup test to exercise the full decode pipeline.",
-            ]
+    streaming_method = getattr(backend, "generate_speech_streaming", None)
+    if streaming_method is None:
+        return
+
+    async def _drain_stream() -> None:
+        async for _chunk, _sample_rate in streaming_method(
+            text="Streaming warmup.",
+            voice="Vivian",
+            language="English",
+        ):
+            pass
+
+    try:
+        await asyncio.wait_for(_drain_stream(), timeout=max_seconds)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"Streaming warmup exceeded {max_seconds:.1f}s"
+        ) from exc
+
+
+async def initialize_backend(warmup: bool = False) -> TTSBackend:
+    """Initialize the global backend exactly once, even under concurrency."""
+    global _backend_instance
+
+    async with _get_initialization_lock():
+        backend = get_backend()
+        if backend.is_ready():
+            return backend
+
+        try:
+            await backend.initialize()
+
+            custom_voices_dir = os.getenv(
+                "TTS_CUSTOM_VOICES",
+                str(Path(__file__).resolve().parent.parent.parent / "custom_voices"),
+            )
             try:
-                custom_names = backend.get_custom_voice_names()
-                for i, _text in enumerate(_warmup_texts, 1):
-                    if backend.get_model_type() == "base" and custom_names:
-                        await backend.generate_speech_with_custom_voice(
-                            text=_text,
-                            voice=custom_names[0],
-                            language="English",
-                        )
-                    elif backend.get_model_type() == "base":
-                        logger.info("Skipping warmup: Base model has no custom voices to warm up with")
-                        break
-                    else:
-                        await backend.generate_speech(
-                            text=_text,
-                            voice="Vivian",
-                            language="English",
-                        )
-                    logger.info(f"Warmup request {i}/{len(_warmup_texts)} completed")
-                logger.info("Backend warmup completed successfully")
-            except Exception as e:
-                logger.warning(f"Backend warmup failed (non-critical): {e}")
-    
-    return backend
+                await backend.load_custom_voices(custom_voices_dir)
+            except Exception as exc:
+                logger.warning("Custom voice loading failed (non-critical): %s", exc)
+
+            if warmup and os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true":
+                try:
+                    await _warmup_backend(backend)
+                except Exception as exc:
+                    logger.error("Backend warmup failed: %s", exc)
+
+            return backend
+        except Exception:
+            # A partially initialized model is unsafe to reuse. The next request
+            # constructs a fresh instance rather than retrying corrupted state.
+            _backend_instance = None
+            raise
 
 
 def reset_backend() -> None:
-    """Reset the global backend instance (useful for testing)."""
-    global _backend_instance
+    """Reset process globals (primarily for tests)."""
+    global _backend_instance, _initialization_lock
     _backend_instance = None
+    _initialization_lock = None

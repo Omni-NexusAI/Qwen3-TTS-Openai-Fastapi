@@ -5,21 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qwen-tts"
 version = "0.1.1"
-description = "Qwen-TTS python package"
+description = "Qwen3-TTS with OpenAI-compatible FastAPI, voice cloning, and multiple inference backends"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
 ]
 license = { text = "Apache-2.0" }
-authors = [{ name = "Alibaba Qwen Team" }]
+authors = [{ name = "Alibaba Qwen Team and contributors" }]
 
 dependencies = [
+  "numpy>=1.24",
   "transformers==4.57.3",
   "accelerate==1.12.0",
   "PyYAML>=6.0",
@@ -46,6 +46,13 @@ api = [
 vllm = [
   "vllm>=0.4.0",
 ]
+mlx = [
+  # mlx-audio 0.3.x pins a Transformers 5 release candidate. Use this extra
+  # in a dedicated Apple Silicon environment rather than mixing it with the
+  # official/CPU backend environment that pins Transformers 4.57.3.
+  "mlx-audio>=0.3.0; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.10'",
+  "huggingface_hub[hf_xet]; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.10'",
+]
 dev = [
   "pytest>=7.0.0",
   "pytest-asyncio>=0.21.0",
@@ -53,8 +60,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Qwen/Qwen3-TTS"
-Repository = "https://github.com/Qwen/Qwen3-TTS"
+Homepage = "https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi"
+Repository = "https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi"
+Upstream = "https://github.com/QwenLM/Qwen3-TTS"
 
 [project.scripts]
 qwen-tts-demo = "qwen_tts.cli.demo:main"
@@ -62,7 +70,7 @@ qwen-tts-api = "api.main:main"
 qwen-tts-voice-studio = "gradio_voice_studio:main"
 
 [tool.setuptools]
-packages = { find = { where = ["."] , include = ["qwen_tts*", "api*"] } }
+packages = { find = { where = ["."], include = ["qwen_tts*", "api*"] } }
 py-modules = ["gradio_voice_studio"]
 include-package-data = true
 

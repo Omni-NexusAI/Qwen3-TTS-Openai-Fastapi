@@ -163,3 +163,25 @@ class VoiceCloneCapabilities(BaseModel):
         ...,
         description="Whether x-vector only mode is available.",
     )
+
+
+class StreamingVoiceCloneRequest(VoiceCloneRequest):
+    """Request schema for Groxaxo's framed Base-clone streaming endpoint.
+
+    This intentionally stays separate from the OpenAI-compatible ``stream``
+    flag.  The endpoint emits Groxaxo's documented framed PCM envelope, which
+    the archived Voice Studio consumes before writing a completed WAV.
+    """
+
+    emit_every_frames: int = Field(
+        default=4,
+        ge=1,
+        le=32,
+        description="Emit an audio chunk every N codec frames.",
+    )
+    decode_window_frames: int = Field(
+        default=80,
+        ge=16,
+        le=200,
+        description="Decoder window size in codec frames.",
+    )

@@ -1,35 +1,30 @@
-version: '3.8'
-
 services:
-  # GPU-enabled service with official backend (default)
   qwen3-tts-gpu:
     build:
       context: .
       dockerfile: Dockerfile
       target: production
     container_name: qwen3-tts-api
-    network_mode: host
     ports:
-      - "8880:8880"
+      - "${TTS_PORT:-8880}:8880"
     environment:
-      - HOST=0.0.0.0
-      - PORT=8880
-      - WORKERS=1
-      - CORS_ORIGINS=*
-      - TTS_BACKEND=official
-      - TTS_WARMUP_ON_START=false
-      # When using device_ids filter, the GPU appears as device 0 inside container
-      - CUDA_VISIBLE_DEVICES=0
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      HOST: 0.0.0.0
+      PORT: 8880
+      WORKERS: 1
+      CORS_ORIGINS: "${CORS_ORIGINS:-*}"
+      TTS_BACKEND: official
+      TTS_MODEL_NAME: "${TTS_MODEL_NAME:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}"
+      TTS_WARMUP_ON_START: "${TTS_WARMUP_ON_START:-false}"
+      TTS_IDLE_TIMEOUT_SECONDS: "${TTS_IDLE_TIMEOUT_SECONDS:-0}"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
-      # Mount model cache for persistence
-      - ~/.cache/huggingface:/home/appuser/.cache/huggingface
+      - "${HF_CACHE_DIR:-~/.cache/huggingface}:/home/appuser/.cache/huggingface"
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['2']
+              count: 1
               capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
@@ -39,36 +34,34 @@ services:
       retries: 3
       start_period: 120s
 
-  # GPU-enabled service with vLLM-Omni backend
   qwen3-tts-vllm:
     build:
       context: .
       dockerfile: Dockerfile.vllm
     container_name: qwen3-tts-api-vllm
-    network_mode: host
     ports:
-      - "8880:8880"
+      - "${TTS_PORT:-8880}:8880"
     environment:
-      - HOST=0.0.0.0
-      - PORT=8880
-      - WORKERS=1
-      - CORS_ORIGINS=*
-      - TTS_BACKEND=vllm_omni
-      - TTS_WARMUP_ON_START=true
-      - TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-      - VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - HF_HOME=/root/.cache/huggingface
+      HOST: 0.0.0.0
+      PORT: 8880
+      WORKERS: 1
+      CORS_ORIGINS: "${CORS_ORIGINS:-*}"
+      TTS_BACKEND: vllm_omni
+      TTS_MODEL_NAME: "${TTS_MODEL_NAME:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}"
+      TTS_WARMUP_ON_START: "${TTS_WARMUP_ON_START:-true}"
+      TTS_IDLE_TIMEOUT_SECONDS: "${TTS_IDLE_TIMEOUT_SECONDS:-0}"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HOME: /root/.cache/huggingface
     volumes:
-      # Mount model cache for persistence
-      - ~/.cache/huggingface:/root/.cache/huggingface
+      - "${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface"
     ipc: host
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['2']
+              count: 1
               capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
@@ -77,28 +70,31 @@ services:
       timeout: 10s
       retries: 3
       start_period: 180s
-    profiles:
-      - vllm
+    profiles: [vllm]
 
-  # CPU-only service
   qwen3-tts-cpu:
     build:
       context: .
       dockerfile: Dockerfile
       target: cpu-base
     container_name: qwen3-tts-api-cpu
-    network_mode: host
     ports:
-      - "8880:8880"
+      - "${TTS_PORT:-8880}:8880"
     environment:
-      - HOST=0.0.0.0
-      - PORT=8880
-      - WORKERS=1
-      - CORS_ORIGINS=*
-      - TTS_BACKEND=official
-      - TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+      HOST: 0.0.0.0
+      PORT: 8880
+      WORKERS: 1
+      CORS_ORIGINS: "${CORS_ORIGINS:-*}"
+      TTS_BACKEND: pytorch
+      TTS_MODEL_NAME: "${TTS_MODEL_NAME:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}"
+      TTS_DEVICE: cpu
+      TTS_DTYPE: float32
+      TTS_ATTN: sdpa
+      CPU_THREADS: "${CPU_THREADS:-12}"
+      CPU_INTEROP: "${CPU_INTEROP:-2}"
+      TTS_IDLE_TIMEOUT_SECONDS: "${TTS_IDLE_TIMEOUT_SECONDS:-0}"
     volumes:
-      - ~/.cache/huggingface:/home/appuser/.cache/huggingface
+      - "${HF_CACHE_DIR:-~/.cache/huggingface}:/home/appuser/.cache/huggingface"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8880/health"]
@@ -106,9 +102,4 @@ services:
       timeout: 10s
       retries: 3
       start_period: 180s
-    profiles:
-      - cpu
-
-# To run GPU version with official backend: docker-compose up qwen3-tts-gpu
-# To run GPU version with vLLM backend: docker-compose --profile vllm up qwen3-tts-vllm
-# To run CPU version: docker-compose --profile cpu up qwen3-tts-cpu
+    profiles: [cpu]

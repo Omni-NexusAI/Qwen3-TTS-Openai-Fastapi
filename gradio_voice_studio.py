@@ -19,8 +19,10 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import shutil
 import tempfile
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -64,6 +66,23 @@ DEFAULT_REFERENCE_LINE = (
 # Fallback voices list used when the server does not provide a voices
 # endpoint or fails to return names.
 FALLBACK_VOICES = ["Vivian", "Ryan", "Serena", "Dylan", "Eric", "Aiden"]
+
+# Profiles are local files.  Keep identifiers deliberately boring so a value
+# copied from the UI can never escape the configured library root.
+PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+MAX_STREAM_METADATA_BYTES = 1024 * 1024
+
+
+class StreamEndpointUnavailable(RuntimeError):
+    """The server does not expose the optional framed clone stream endpoint."""
+
+
+def validate_profile_id(profile_id: str) -> str:
+    """Validate a local profile id before using it in a filesystem path."""
+    normalized = str(profile_id or "").strip()
+    if not PROFILE_ID_RE.fullmatch(normalized):
+        raise ValueError("Profile id is invalid. Refresh the library and select a saved profile.")
+    return normalized
 
 
 @dataclass
@@ -121,7 +140,7 @@ def safe_profile_id() -> str:
 
 def profile_dir(library_dir: Path, profile_id: str) -> Path:
     """Return the path to a given profile's directory."""
-    return ensure_dirs(library_dir)["profiles"] / profile_id
+    return ensure_dirs(library_dir)["profiles"] / validate_profile_id(profile_id)
 
 
 def meta_path(library_dir: Path, profile_id: str) -> Path:
@@ -132,8 +151,16 @@ def meta_path(library_dir: Path, profile_id: str) -> Path:
 def load_profile(library_dir: Path, profile_id: str) -> VoiceProfile:
     """Load a profile from disk into a VoiceProfile instance."""
     p = meta_path(library_dir, profile_id)
-    data = json.loads(p.read_text(encoding="utf-8"))
-    return VoiceProfile(**data)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        profile = VoiceProfile(**data)
+    except FileNotFoundError as exc:
+        raise ValueError("That saved profile no longer exists. Refresh the library.") from exc
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("That saved profile is invalid. Refresh the library or restore it from export.") from exc
+    if profile.profile_id != validate_profile_id(profile_id):
+        raise ValueError("The saved profile id does not match its metadata.")
+    return profile
 
 
 def save_profile(library_dir: Path, vp: VoiceProfile) -> None:
@@ -156,6 +183,8 @@ def list_profiles(library_dir: Path) -> List[VoiceProfile]:
     out: List[VoiceProfile] = []
     for child in sorted(dirs.iterdir(), key=lambda p: p.name):
         if child.is_dir():
+            if not PROFILE_ID_RE.fullmatch(child.name):
+                continue
             mp = child / "meta.json"
             if mp.exists():
                 try:
@@ -200,6 +229,11 @@ def data_uri_from_file(file_path: Path) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def base64_from_file(file_path: Path) -> str:
+    """Encode a file's contents as base64 string (no data URI prefix)."""
+    return base64.b64encode(file_path.read_bytes()).decode("utf-8")
+
+
 def write_bytes_to_temp_audio(content: bytes, ext: str) -> str:
     """Write raw audio bytes to a temporary file and return its path."""
     ext = ext.lstrip(".")
@@ -207,6 +241,41 @@ def write_bytes_to_temp_audio(content: bytes, ext: str) -> str:
     os.close(fd)
     Path(path).write_bytes(content)
     return path
+
+
+def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """Convert raw PCM bytes to WAV format with proper header."""
+    import struct
+    import io
+    
+    bytes_per_sample = bits_per_sample // 8
+    byte_rate = sample_rate * num_channels * bytes_per_sample
+    block_align = num_channels * bytes_per_sample
+    data_size = len(pcm_bytes)
+    
+    buffer = io.BytesIO()
+    
+    # RIFF header
+    buffer.write(b'RIFF')
+    buffer.write(struct.pack('<I', 36 + data_size))  # File size - 8
+    buffer.write(b'WAVE')
+    
+    # Format chunk
+    buffer.write(b'fmt ')
+    buffer.write(struct.pack('<I', 16))  # Chunk size
+    buffer.write(struct.pack('<H', 1))  # Audio format (PCM)
+    buffer.write(struct.pack('<H', num_channels))
+    buffer.write(struct.pack('<I', sample_rate))
+    buffer.write(struct.pack('<I', byte_rate))
+    buffer.write(struct.pack('<H', block_align))
+    buffer.write(struct.pack('<H', bits_per_sample))
+    
+    # Data chunk
+    buffer.write(b'data')
+    buffer.write(struct.pack('<I', data_size))
+    buffer.write(pcm_bytes)
+    
+    return buffer.getvalue()
 
 
 def request_tts(base_url: str, payload: Dict[str, Any], timeout_s: float) -> Tuple[bytes, str]:
@@ -221,6 +290,124 @@ def request_tts(base_url: str, payload: Dict[str, Any], timeout_s: float) -> Tup
     if ext == "pcm":
         ext = "raw"
     return r.content, ext
+
+
+def request_tts_voice_clone(base_url: str, payload: Dict[str, Any], timeout_s: float) -> Tuple[bytes, str]:
+    """Call the /v1/audio/voice-clone endpoint (non-streaming) and return audio bytes and extension."""
+    url = normalize_base_url(base_url) + "/v1/audio/voice-clone"
+    response_format = payload.get("response_format") or "wav"
+    payload["response_format"] = response_format
+    with httpx.Client(timeout=timeout_s) as client:
+        r = client.post(url, json=payload)
+        r.raise_for_status()
+    ext = response_format.lower()
+    if ext == "pcm":
+        ext = "raw"
+    return r.content, ext
+
+
+def request_tts_streaming(
+    base_url: str, 
+    payload: Dict[str, Any], 
+    timeout_s: float
+) -> Tuple[bytes, str, Dict[str, Any]]:
+    """
+    Call the /v1/audio/voice-clone/stream endpoint and return audio bytes, extension, and timing info.
+    
+    Returns:
+        Tuple of (audio_bytes, extension, timing_info)
+    """
+    import struct
+    import json as json_module
+    
+    url = normalize_base_url(base_url) + "/v1/audio/voice-clone/stream"
+    
+    started_at = time.monotonic()
+    with httpx.Client(timeout=timeout_s) as client:
+        with client.stream("POST", url, json=payload) as response:
+            if response.status_code in {404, 405, 501}:
+                raise StreamEndpointUnavailable(
+                    "This server does not provide framed clone streaming. Choose Non-streaming instead."
+                )
+            response.raise_for_status()
+            
+            chunks = []
+            timing_info = {}
+            buffer = b""
+            
+            for chunk in response.iter_bytes():
+                buffer += chunk
+                
+                # Process complete chunks
+                # Format: [4 bytes JSON length][JSON metadata][4 bytes audio length][audio bytes]
+                while len(buffer) >= 4:
+                    json_len = struct.unpack('<I', buffer[:4])[0]
+                    if json_len > MAX_STREAM_METADATA_BYTES:
+                        raise RuntimeError("Streaming response metadata is invalid or too large.")
+                    if len(buffer) < 4 + json_len + 4:
+                        break  # Need more data for JSON + audio length
+                    
+                    json_bytes = buffer[4:4 + json_len]
+                    metadata = json_module.loads(json_bytes.decode('utf-8'))
+                    audio_len = struct.unpack('<I', buffer[4 + json_len:4 + json_len + 4])[0]
+                    
+                    if len(buffer) < 4 + json_len + 4 + audio_len:
+                        break  # Need more data for audio bytes
+                    
+                    audio_bytes = buffer[4 + json_len + 4:4 + json_len + 4 + audio_len]
+                    buffer = buffer[4 + json_len + 4 + audio_len:]  # Keep remaining data
+                    
+                    if metadata.get("error"):
+                        raise RuntimeError(metadata["error"])
+                    
+                    if metadata.get("done"):
+                        timing_info = {
+                            "first_chunk_time": metadata.get("first_chunk_time"),
+                            "total_time": metadata.get("total_time"),
+                            "audio_duration": metadata.get("audio_duration"),
+                            "rtf": metadata.get("rtf"),
+                            "chunk_count": metadata.get("chunk_count"),
+                        }
+                    elif len(audio_bytes) > 0:
+                        chunks.append(audio_bytes)
+            
+            # Combine all audio chunks (raw PCM data)
+            total_length = sum(len(c) for c in chunks)
+            combined_pcm = b"".join(chunks)
+            
+            # Convert raw PCM to WAV format with proper header
+            # PCM is 16-bit signed integers at 24000 Hz
+            wav_bytes = pcm_to_wav(combined_pcm, sample_rate=24000)
+            
+            timing_info.setdefault("first_chunk_time", None)
+            timing_info.setdefault("total_time", time.monotonic() - started_at)
+            timing_info.setdefault("audio_duration", len(combined_pcm) / (24000 * 2))
+            timing_info.setdefault("rtf", None)
+            timing_info.setdefault("chunk_count", len(chunks))
+            timing_info["completed"] = bool(timing_info.get("chunk_count"))
+            return wav_bytes, "wav", timing_info
+
+
+def timing_markdown(timing_info: Dict[str, Any], *, delivery_mode: str) -> str:
+    """Render timing without turning absent server fields into a callback error."""
+    def number(name: str, suffix: str = "s") -> str:
+        value = timing_info.get(name)
+        return f"{float(value):.2f}{suffix}" if isinstance(value, (int, float)) else "not reported"
+
+    status = "complete" if timing_info.get("completed") else "ended without final timing metadata"
+    return f"""### Generation diagnostics
+| Metric | Value |
+|--------|-------|
+| **Delivery mode** | {delivery_mode} |
+| **Stream status** | {status} |
+| **First chunk** | {number("first_chunk_time")} |
+| **Total time** | {number("total_time")} |
+| **Audio duration** | {number("audio_duration")} |
+| **RTF** | {number("rtf", "x")} |
+| **Chunks** | {timing_info.get("chunk_count", 0)} |
+
+Streaming here means Groxaxo's framed clone response was consumed successfully. The Studio writes one completed WAV for browser playback; it does not claim native browser-incremental playback.
+"""
 
 
 def try_fetch_voices(base_url: str, timeout_s: float) -> List[str]:
@@ -333,7 +520,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
         # Header section
         gr.HTML(
             """
-            <div id="header">
+            <div id=","header">
               <div style="font-size: 1.35rem; font-weight: 700;">Qwen3 Voice Studio</div>
               <div class="small">
                 Create & save reusable voice profiles (preset, designed, or cloned) and export them for inference.
@@ -409,7 +596,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                                 preset_generate_btn = gr.Button("Generate", variant="primary")
                                 preset_save_btn = gr.Button("Save profile", variant="secondary")
                             with gr.Column(scale=1, min_width=320):
-                                preset_audio = gr.Audio(label="Output audio", type="filepath")
+                                preset_audio = gr.Audio(label="Output audio (trimmable)", type="filepath", editable=True)
                                 preset_download = gr.File(label="Download audio")
 
                     # Voice design (VoiceDesign)
@@ -447,7 +634,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                                 design_generate_btn = gr.Button("Generate reference clip", variant="primary")
                                 design_save_as_clone_btn = gr.Button("Save as reusable clone profile", variant="secondary")
                             with gr.Column(scale=1, min_width=320):
-                                design_audio = gr.Audio(label="Reference audio (output)", type="filepath")
+                                design_audio = gr.Audio(label="Reference audio (output, trimmable)", type="filepath", editable=True)
                                 design_download = gr.File(label="Download reference audio")
 
                     # Voice clone (Base)
@@ -491,10 +678,16 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                                     value="Hello! This is a voice clone test.",
                                     lines=3,
                                 )
+                                clone_delivery_mode = gr.Radio(
+                                    label="Delivery mode",
+                                    choices=["Streaming", "Non-streaming"],
+                                    value="Streaming",
+                                    info="Streaming consumes Groxaxo's framed clone response and saves a completed WAV for playback. Non-streaming waits for one complete response.",
+                                )
                                 clone_generate_btn = gr.Button("Generate", variant="primary")
                                 clone_save_btn = gr.Button("Save clone profile", variant="secondary")
                             with gr.Column(scale=1, min_width=320):
-                                clone_audio = gr.Audio(label="Output audio", type="filepath")
+                                clone_audio = gr.Audio(label="Output audio (trimmable)", type="filepath", editable=True)
                                 clone_download = gr.File(label="Download audio")
 
             # Library tab
@@ -532,10 +725,20 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                             value="wav",
                         )
                         play_speed = gr.Slider(label="Speed", minimum=0.25, maximum=4.0, value=1.0, step=0.05)
-                        play_generate_btn = gr.Button("Generate", variant="primary")
+                        play_delivery_mode = gr.Radio(
+                            label="Base clone delivery mode",
+                            choices=["Streaming", "Non-streaming"],
+                            value="Streaming",
+                            info="Only Base clone profiles support Groxaxo's framed streaming endpoint. Other profile types remain non-streaming.",
+                        )
+                        play_generate_btn = gr.Button("🎙️ Generate", variant="primary")
                     with gr.Column(scale=1, min_width=360):
-                        play_audio = gr.Audio(label="Output audio", type="filepath")
+                        play_audio = gr.Audio(label="Output audio (trimmable)", type="filepath", editable=True)
                         play_download = gr.File(label="Download audio")
+                        # Timing display
+                        play_timing = gr.Markdown(
+                            value="",
+                        )
 
         # ------------------------------------------------------------------
         # Callback implementations
@@ -636,25 +839,35 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
             ref_text: str,
             xvec_only: bool,
             text: str,
+            delivery_mode: str,
         ):
             if not ref_audio_path or not Path(ref_audio_path).exists():
                 raise gr.Error("Reference audio is required.")
             if (not xvec_only) and (not ref_text.strip()):
                 raise gr.Error("Reference transcript is required unless x_vector_only_mode is enabled.")
-            ref_uri = data_uri_from_file(Path(ref_audio_path))
+            ref_b64 = base64_from_file(Path(ref_audio_path))
             payload = {
                 "input": text,
                 "voice": "Vivian",
                 "language": language,
                 "task_type": "Base",
-                "ref_audio": ref_uri,
+                "ref_audio": ref_b64,
                 "ref_text": ref_text.strip(),
                 "x_vector_only_mode": bool(xvec_only),
                 "response_format": "wav",
             }
-            audio_bytes, ext = request_tts(base_url, payload, float(timeout_s))
+            if delivery_mode == "Streaming":
+                try:
+                    audio_bytes, ext, timing_info = request_tts_streaming(base_url, payload, float(timeout_s))
+                    out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                    return out_path, out_path, timing_markdown(timing_info, delivery_mode="Streaming")
+                except StreamEndpointUnavailable as exc:
+                    raise gr.Error(str(exc)) from exc
+                except Exception as exc:
+                    raise gr.Error(f"Streaming clone generation failed; no fallback was started: {exc}") from exc
+            audio_bytes, ext = request_tts_voice_clone(base_url, payload, float(timeout_s))
             out_path = write_bytes_to_temp_audio(audio_bytes, ext)
-            return out_path, out_path, "✅ Generated audio."
+            return out_path, out_path, "### Generation diagnostics\n\n| **Delivery mode** | Non-streaming |\n|---|---|\n| **Status** | complete |"
 
         def on_save_clone_profile(
             library_dir_str: str,
@@ -733,6 +946,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
             text: str,
             fmt: str,
             speed: float,
+            delivery_mode: str,
         ):
             if not pid:
                 raise gr.Error("Pick a saved profile.")
@@ -749,6 +963,10 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                     "voice": vp.voice,
                     "instructions": vp.instructions or "",
                 })
+                # Use non-streaming for CustomVoice
+                audio_bytes, ext = request_tts(base_url, payload, float(timeout_s))
+                out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                return out_path, out_path, "### Generation diagnostics\n\nCustomVoice uses Groxaxo's non-streaming API path."
             elif vp.task_type == "Base":
                 payload.update({
                     "task_type": "Base",
@@ -759,22 +977,35 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                     ref_file = profile_dir(Path(library_dir_str), vp.profile_id) / vp.ref_audio_filename
                     if not ref_file.exists():
                         raise gr.Error("This profile is missing its reference audio file.")
-                    payload["ref_audio"] = data_uri_from_file(ref_file)
+                    payload["ref_audio"] = base64_from_file(ref_file)
                 else:
                     raise gr.Error("This Base profile has no stored ref_audio.")
                 if not vp.x_vector_only_mode:
                     if not vp.ref_text.strip():
                         raise gr.Error("This profile needs ref_text unless x_vector_only_mode is enabled.")
                     payload["ref_text"] = vp.ref_text.strip()
+                
+                if delivery_mode == "Streaming":
+                    try:
+                        audio_bytes, ext, timing_info = request_tts_streaming(base_url, payload, float(timeout_s))
+                        out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                        return out_path, out_path, timing_markdown(timing_info, delivery_mode="Streaming")
+                    except StreamEndpointUnavailable as exc:
+                        raise gr.Error(str(exc)) from exc
+                    except Exception as exc:
+                        raise gr.Error(f"Streaming generation failed; no fallback was started: {exc}") from exc
+                audio_bytes, ext = request_tts_voice_clone(base_url, payload, float(timeout_s))
+                out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                return out_path, out_path, "### Generation diagnostics\n\n| **Delivery mode** | Non-streaming |\n|---|---|\n| **Status** | complete |"
             else:
                 payload.update({
                     "task_type": "VoiceDesign",
                     "voice": vp.voice or "Vivian",
                     "instructions": vp.instructions or "",
                 })
-            audio_bytes, ext = request_tts(base_url, payload, float(timeout_s))
-            out_path = write_bytes_to_temp_audio(audio_bytes, ext)
-            return out_path, out_path
+                audio_bytes, ext = request_tts(base_url, payload, float(timeout_s))
+                out_path = write_bytes_to_temp_audio(audio_bytes, ext)
+                return out_path, out_path, "### Generation diagnostics\n\nVoiceDesign uses Groxaxo's non-streaming API path."
 
         # ------------------------------------------------------------------
         # Wire up UI interactions to callbacks
@@ -810,7 +1041,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
 
         clone_generate_btn.click(
             fn=on_generate_clone,
-            inputs=[base_url_in, timeout_in, clone_language, clone_ref_audio, clone_ref_text, clone_xvec_only, clone_test_text],
+            inputs=[base_url_in, timeout_in, clone_language, clone_ref_audio, clone_ref_text, clone_xvec_only, clone_test_text, clone_delivery_mode],
             outputs=[clone_audio, clone_download, global_log],
         )
         clone_save_btn.click(
@@ -852,8 +1083,8 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
 
         play_generate_btn.click(
             fn=on_play_generate,
-            inputs=[base_url_in, timeout_in, library_dir_in, play_profile_id, play_text, play_response_format, play_speed],
-            outputs=[play_audio, play_download],
+            inputs=[base_url_in, timeout_in, library_dir_in, play_profile_id, play_text, play_response_format, play_speed, play_delivery_mode],
+            outputs=[play_audio, play_download, play_timing],
         )
 
         demo.load(fn=on_library_refresh, inputs=[library_dir_in], outputs=[library_table, play_profile_id])
